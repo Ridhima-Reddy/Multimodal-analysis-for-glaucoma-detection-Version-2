@@ -1,0 +1,47 @@
+import pandas as pd
+
+# 1. Load your CSV files
+df1 = pd.read_csv('blood flow.csv')
+df2 = pd.read_csv('RNFL.csv')
+
+# 2. Smart function to find the SNO column variant
+def find_sno_column(dataframe):
+    for col in dataframe.columns:
+        if str(col).strip().lower() == 'sno':
+            return col
+    return None
+
+sno_col1 = find_sno_column(df1)
+sno_col2 = find_sno_column(df2)
+
+if sno_col1 and sno_col2:
+    # 3. Find matching column names across both files (ignoring case)
+    # This prevents the creation of _x and _y columns
+    cols_to_drop_from_df2 = []
+    
+    for col2 in df2.columns:
+        # Skip the SNO column itself
+        if col2 == sno_col2:
+            continue
+            
+        # If a column in df2 exists in df1 (matching by lower case/spaces), mark it for removal
+        for col1 in df1.columns:
+            if col1 != sno_col1 and str(col2).strip().lower() == str(col1).strip().lower():
+                cols_to_drop_from_df2.append(col2)
+    
+    # Drop the duplicate columns from the second file before merging
+    df2_cleaned = df2.drop(columns=cols_to_drop_from_df2)
+    
+    # 4. Merge cleanly without duplicates
+    merged_df = pd.merge(df1, df2_cleaned, left_on=sno_col1, right_on=sno_col2, how='inner')
+    
+    # If SNO names were spelled slightly differently, drop the duplicate SNO column
+    if sno_col1 != sno_col2:
+        merged_df = merged_df.drop(columns=[sno_col2])
+        
+    # Save the output
+    merged_df.to_csv('merged_output.csv', index=False)
+    print("Files merged perfectly with no duplicate columns!")
+    print(f"Final columns: {list(merged_df.columns)}")
+else:
+    print("Error: Could not find a matching 'SNO' column.")
