@@ -1,0 +1,241 @@
+# ==========================================
+# BLOCK 1 – IMPORTS
+# ==========================================
+import pathlib
+import warnings
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import shap
+import statsmodels.api as sm
+from sklearn.linear_model import LogisticRegression, LogisticRegressionCV
+from sklearn.preprocessing import StandardScaler
+
+# Suppress unnecessary warnings
+warnings.filterwarnings("ignore")
+
+# Set professional plotting aesthetics
+plt.rcParams.update(
+    {
+        "font.size": 11,
+        "axes.labelsize": 12,
+        "axes.titlesize": 14,
+        "figure.titlesize": 16,
+    }
+)
+
+# ==========================================
+# BLOCK 2 – LOAD DATA
+# ==========================================
+csv_path = pathlib.Path("cleaned_octa_data.csv")
+if not csv_path.exists():
+    raise FileNotFoundError(
+        f"Could not find '{csv_path}'. Please ensure it is in the working directory."
+    )
+
+df = pd.read_csv(csv_path)
+target = "glaucoma"
+
+# Replicate exact exclusions from the original pipeline
+exclude_exact = [
+    "SNO",
+    "Date",
+    "ID_str",
+    "AXIS",
+    "CYL",
+    "ONH movt artefact",
+    "Eye",
+    "SPH",
+    "SE",
+    "Lens status",
+    "Gender",
+    "Age",
+    target,
+]
+exclude_list = [
+    col for col in df.columns if col in exclude_exact or "Unnamed" in col
+]
+features = [
+    col
+    for col in df.columns
+    if col not in exclude_list and pd.api.types.is_numeric_dtype(df[col])
+]
+
+y = df[target]
+X_raw = df[features].copy()
+
+# ==========================================
+# BLOCK 3 – PREPROCESSING
+# ==========================================
+# Median imputation for missing data matching the notebook pipeline
+for col in X_raw.columns:
+    X_raw[col] = X_raw[col].fillna(X_raw[col].median())
+
+# ==========================================
+# BLOCK 4 – UNIVARIATE LOGISTIC REGRESSION
+# ==========================================
+univariate_results = []
+
+for feat in features:
+    X_single = X_raw[[feat]]
+    if X_single.var().iloc[0] < 1e-12:
+        continue
+    try:
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(X_single)
+        X_sm = sm.add_constant(X_scaled)
+
+        model = sm.Logit(y, X_sm)
+        res = model.fit(disp=False, maxiter=1000)
+
+        beta = res.params.iloc[1]
+        pval = res.pvalues.iloc[1]
+        conf_int = res.conf_int().iloc[1]
+
+        univariate_results.append(
+            {"Feature": feat, "Beta": beta, "P_value": pval}
+        )
+    except Exception:
+        continue
+
+df_uni = pd.DataFrame(univariate_results)
+df_sig_05 = df_uni[df_uni["P_value"] < 0.05]
+sig_features_05 = df_sig_05["Feature"].tolist()
+
+# ==========================================
+# BLOCK 5 – LASSO FEATURE SELECTION
+# ==========================================
+X_lasso_input = X_raw[sig_features_05].copy()
+scaler_lasso = StandardScaler()
+X_lasso_scaled = scaler_lasso.fit_transform(X_lasso_input)
+
+explicit_cs = np.logspace(-4, 4, 50)
+
+lasso_cv = LogisticRegressionCV(
+    Cs=explicit_cs,
+    penalty="l1",
+    solver="liblinear",
+    cv=5,
+    scoring="roc_auc",
+    max_iter=10000,
+    random_state=42,
+)
+lasso_cv.fit(X_lasso_scaled, y)
+
+df_lasso_results = pd.DataFrame(
+    {"Feature": sig_features_05, "LASSO_Coefficient": lasso_cv.coef_[0]}
+)
+selected_features_df = df_lasso_results[
+    df_lasso_results["LASSO_Coefficient"] != 0
+]
+final_features = selected_features_df["Feature"].tolist()
+
+print("--- Pipeline Feature Selection Summary ---")
+print(f"Features with p < 0.05:          {len(sig_features_05)}")
+print(f"Features retained after LASSO:   {len(final_features)}\n")
+print(f"Selected Biomarkers: {final_features}\n")
+
+# ==========================================
+# BLOCK 6 – FINAL LOGISTIC REGRESSION
+# ==========================================
+X_final = X_raw[final_features].copy()
+
+# Store components exactly as required
+scaler = StandardScaler()
+scaled_feature_matrix = scaler.fit_transform(X_final)
+
+trained_model = LogisticRegression(
+    penalty=None, solver="lbfgs", class_weight="balanced", max_iter=10000
+)
+trained_model.fit(scaled_feature_matrix, y)
+
+# ==========================================
+# BLOCK 7 – SHAP
+# ==========================================
+# Use LinearExplainer with training data distribution masking for linear models
+explainer = shap.LinearExplainer(trained_model, scaled_feature_matrix)
+shap_values = explainer(scaled_feature_matrix)
+
+# Assign feature names to the underlying SHAP values object for accurate plotting
+shap_values.feature_names = final_features
+
+# ==========================================
+# BLOCK 8 – GLOBAL EXPLAINABILITY
+# ==========================================
+print("Generating global explanation plots...")
+
+# SHAP Summary Plot
+fig, ax = plt.subplots(figsize=(8, 5))
+shap.summary_plot(
+    shap_values,
+    scaled_feature_matrix,
+    feature_names=final_features,
+    show=False,
+)
+plt.title("SHAP Global Summary Feature Importance Mapping", pad=20)
+plt.savefig("shap_summary.png", dpi=300, bbox_inches="tight")
+plt.close()
+
+# SHAP Bar Plot
+fig, ax = plt.subplots(figsize=(8, 5))
+shap.plots.bar(shap_values, show=False)
+plt.title("SHAP Mean Absolute Feature Importance", pad=20)
+plt.savefig("shap_bar.png", dpi=300, bbox_inches="tight")
+plt.close()
+
+# ==========================================
+# BLOCK 9 – REPRESENTATIVE PATIENT SELECTION
+# ==========================================
+
+# Representative cases corresponding to the Grad-CAM examples
+idx_normal_rep = 1085      # SNO = 1086 (1086_OS.png)
+idx_glaucoma_rep = 403     # SNO = 404 (404_OS.png)
+
+loc_normal = df.index.get_loc(idx_normal_rep)
+loc_glaucoma = df.index.get_loc(idx_glaucoma_rep)
+
+print("--- Representative Case Profiles Selected ---")
+print(
+    f"Normal Case (Row ID: {idx_normal_rep}) -> Prob: {probs[loc_normal]:.4f}"
+)
+print(
+    f"Glaucoma Case (Row ID: {idx_glaucoma_rep}) -> Prob: {probs[loc_glaucoma]:.4f}"
+)
+
+# ==========================================
+# BLOCK 10 – LOCAL EXPLAINABILITY
+# ==========================================
+print("Generating patient-specific waterfall explanation plots...")
+
+# Row-level mapping overrides for display purposes
+raw_feature_values = X_final.values
+
+# Generate Representative Normal Case Waterfall Plot
+fig = plt.figure(figsize=(9, 5))
+shap_obs_normal = shap.Explanation(
+    values=shap_values.values[loc_normal],
+    base_values=shap_values.base_values[loc_normal],
+    data=raw_feature_values[loc_normal],
+    feature_names=final_features,
+)
+shap.plots.waterfall(shap_obs_normal, show=False)
+plt.title("Representative Normal Case\nOCTA Biomarker Explanation", pad=20)
+plt.savefig("shap_waterfall_normal.png", dpi=300, bbox_inches="tight")
+plt.close()
+
+# Generate Representative Glaucoma Case Waterfall Plot
+fig = plt.figure(figsize=(9, 5))
+shap_obs_glaucoma = shap.Explanation(
+    values=shap_values.values[loc_glaucoma],
+    base_values=shap_values.base_values[loc_glaucoma],
+    data=raw_feature_values[loc_glaucoma],
+    feature_names=final_features,
+)
+shap.plots.waterfall(shap_obs_glaucoma, show=False)
+plt.title("Representative Glaucoma Case\nOCTA Biomarker Explanation", pad=20)
+plt.savefig("shap_waterfall_glaucoma.png", dpi=300, bbox_inches="tight")
+plt.close()
+
+print(
+    "Execution complete. Output images ('shap_summary.png', 'shap_bar.png', 'shap_waterfall_normal.png', 'shap_waterfall_glaucoma.png') saved."
+)
