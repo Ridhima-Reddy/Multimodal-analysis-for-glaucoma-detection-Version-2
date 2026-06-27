@@ -1,0 +1,542 @@
+# Enhanced resnet50 with five fold cross validation, class weighting, and resumability
+import json
+import os
+import random
+import shutil
+import tempfile
+from pathlib import Path
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torchvision.models as models
+import torchvision.transforms as T
+from sklearn.metrics import accuracy_score, confusion_matrix, roc_auc_score
+from sklearn.model_selection import KFold
+from torch.utils.data import DataLoader, Subset, random_split
+from torchvision.datasets import ImageFolder
+from tqdm import tqdm
+
+# Force CUDA device 4 if available
+if torch.cuda.is_available():
+    device = torch.device("cuda")
+else:
+    device = torch.device("cpu")
+
+print("Using device:", device)
+
+
+# -------------------------
+def set_seed(seed=42):
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def compute_metrics(y_true, y_probs, threshold=0.5):
+    y_true = torch.tensor(y_true).numpy()
+    y_probs = torch.tensor(y_probs).numpy()
+    auc = roc_auc_score(y_true, y_probs)
+    y_pred = (y_probs >= threshold).astype(int)
+    acc = accuracy_score(y_true, y_pred)
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
+    sens = tp / (tp + fn)
+    spec = tn / (tn + fp)
+    return auc, acc, sens, spec
+
+
+def create_resnet50_model():
+    """Create and return a new ResNet-50 model"""
+    model = models.resnet50(pretrained=True)
+
+    model.fc = nn.Sequential(
+        nn.Dropout(0.3),
+        nn.Linear(model.fc.in_features, 512),
+        nn.ReLU(inplace=True),
+        nn.BatchNorm1d(512),
+        nn.Dropout(0.2),
+        nn.Linear(512, 1),
+    )
+    return model.to(device)
+
+
+def train_fold(
+    model, train_loader, val_loader, fold, pos_weight, epochs=50, lr=1e-4
+):
+    """Train and validate for a single fold with class weighting"""
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": model.conv1.parameters(), "lr": lr / 10},
+            {"params": model.bn1.parameters(), "lr": lr / 10},
+            {"params": model.layer1.parameters(), "lr": lr / 10},
+            {"params": model.layer2.parameters(), "lr": lr / 5},
+            {"params": model.layer3.parameters(), "lr": lr / 2},
+            {"params": model.layer4.parameters(), "lr": lr},
+            {"params": model.fc.parameters(), "lr": lr},
+        ],
+        weight_decay=1e-4,
+    )
+
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer, T_0=10, T_mult=2
+    )
+
+    best_auc = 0.0
+    best_metrics = {}
+    patience_counter = 0
+    patience = 12
+    fold_history = []
+
+    print(f"\n🚀 Starting Fold {fold} training:")
+
+    for epoch in range(1, epochs + 1):
+        model.train()
+        total_loss = 0
+
+        scaler = (
+            torch.cuda.amp.GradScaler() if device.type == "cuda" else None
+        )
+
+        for imgs, labels in tqdm(
+            train_loader, desc=f"Fold{fold} Epoch {epoch}/{epochs}"
+        ):
+            imgs, labels = imgs.to(device), labels.float().to(device)
+            optimizer.zero_grad()
+
+            if device.type == "cuda":
+                with torch.cuda.amp.autocast():
+                    out = model(imgs).squeeze(1)
+                    loss = criterion(out, labels)
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), max_norm=1.0
+                )
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                out = model(imgs).squeeze(1)
+                loss = criterion(out, labels)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), max_norm=1.0
+                )
+                optimizer.step()
+
+            total_loss += loss.item() * imgs.size(0)
+
+        avg_loss = total_loss / len(train_loader.dataset)
+        current_lr = optimizer.param_groups[0]["lr"]
+
+        # Validation
+        model.eval()
+        all_probs, all_labels = [], []
+        with torch.no_grad():
+            for imgs, labels in val_loader:
+                imgs = imgs.to(device)
+                out = torch.sigmoid(model(imgs).squeeze(1)).cpu()
+                all_probs.extend(out)
+                all_labels.extend(labels)
+
+        auc, acc, sens, spec = compute_metrics(all_labels, all_probs)
+
+        scheduler.step()
+
+        print(
+            f"Fold{fold} Epoch {epoch} | Loss {avg_loss:.4f} | Val AUC {auc:.4f} | Acc {acc:.3f} | Sens {sens:.3f} | Spec {spec:.3f} | LR {current_lr:.2e}"
+        )
+
+        fold_history.append(
+            {
+                "fold": fold,
+                "epoch": epoch,
+                "loss": avg_loss,
+                "auc": auc,
+                "acc": acc,
+                "sens": sens,
+                "spec": spec,
+            }
+        )
+
+        if auc > best_auc:
+            best_auc = auc
+            best_metrics = {
+                "auc": auc,
+                "acc": acc,
+                "sens": sens,
+                "spec": spec,
+            }
+            patience_counter = 0
+            # Save relative to current directory (no extra folder prefix)
+            torch.save(
+                model.state_dict(), f"best_resnet50_fold{fold}_safe.pth"
+            )
+            print(f"✅ Saved best model for Fold {fold}")
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print(
+                    f"🛑 Early stopping triggered at epoch {epoch} for Fold {fold}"
+                )
+                break
+
+    return best_metrics, fold_history
+
+
+def safe_load_model_state_dict(model_path, model):
+    """Safely load model state dict with PyTorch 2.6 compatibility"""
+    try:
+        state_dict = torch.load(model_path, weights_only=True)
+        model.load_state_dict(state_dict)
+        return True
+    except:
+        try:
+            print(f"⚠️  Using weights_only=False for loading fold model.")
+            state_dict = torch.load(model_path, weights_only=False)
+            model.load_state_dict(state_dict)
+            return True
+        except Exception as e:
+            print(f"❌ Error loading model for fold: {e}")
+            return False
+
+
+# -------------------------
+# Resumability helpers
+PROGRESS_FILE = "cv_progress_resnet50.json"
+
+
+def load_progress():
+    if os.path.exists(PROGRESS_FILE):
+        with open(PROGRESS_FILE, "r") as f:
+            return json.load(f)
+    return {"completed_folds": [], "fold_results": []}
+
+
+def save_progress(progress):
+    with open(PROGRESS_FILE, "w") as f:
+        json.dump(progress, f, indent=2)
+
+
+# -------------------------
+def main(
+    data_dir="Dataset",  # relative to current folder
+    img_size=224,
+    batch_size=32,
+    epochs=50,
+    lr=1e-4,
+    n_splits=5,
+):
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print("Device:", device)
+    set_seed(42)
+
+    # ---------------- Inspect folder structure ----------------
+    print(f"\n📁 Looking inside data directory: {data_dir}")
+    if not os.path.exists(data_dir):
+        raise FileNotFoundError(f"❌ Data directory not found: {data_dir}")
+
+    print("Subfolders found:")
+    for item in os.listdir(data_dir):
+        path = os.path.join(data_dir, item)
+        if os.path.isdir(path):
+            print(f" - {item}/  ({len(os.listdir(path))} files)")
+        else:
+            print(f" - {item} (file)")
+
+    print("\n🔍 Checking for image samples in each folder:")
+    for cls in os.listdir(data_dir):
+        cls_path = os.path.join(data_dir, cls)
+        if not os.path.isdir(cls_path) or cls.startswith("."):
+            continue
+        imgs = [
+            f
+            for f in os.listdir(cls_path)
+            if f.lower().endswith(
+                (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp")
+            )
+        ]
+        print(f"Class: {cls} | Found {len(imgs)} images")
+        if imgs:
+            print("  e.g. →", imgs[:3])
+
+    # ---------------- Clean dataset directory ----------------
+    valid_class_dirs = [
+        d
+        for d in os.listdir(data_dir)
+        if os.path.isdir(os.path.join(data_dir, d)) and not d.startswith(".")
+    ]
+    print(f"\n✅ Valid class folders used for training: {valid_class_dirs}\n")
+
+    if len(valid_class_dirs) < 2:
+        raise RuntimeError(
+            f"❌ Expected ≥2 class folders but found: {valid_class_dirs}"
+        )
+
+    clean_root = tempfile.mkdtemp(prefix="fundus_clean_")
+    for cls in valid_class_dirs:
+        src = os.path.join(data_dir, cls)
+        dst = os.path.join(clean_root, cls)
+        shutil.copytree(src, dst)
+    print(f"📂 Using cleaned dataset at: {clean_root}")
+
+    # ---------------- ENHANCED Data Transforms ----------------
+    train_t = T.Compose(
+        [
+            T.Resize((img_size, img_size)),
+            T.RandomHorizontalFlip(p=0.5),
+            T.RandomVerticalFlip(p=0.3),
+            T.RandomRotation(degrees=20),
+            T.RandomAffine(
+                degrees=0, translate=(0.15, 0.15), scale=(0.85, 1.15)
+            ),
+            T.ColorJitter(
+                brightness=0.3, contrast=0.3, saturation=0.2, hue=0.05
+            ),
+            T.GaussianBlur(kernel_size=3, sigma=(0.1, 2.0)),
+            T.ToTensor(),
+            T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        ]
+    )
+    val_t = T.Compose(
+        [
+            T.Resize((img_size, img_size)),
+            T.ToTensor(),
+            T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        ]
+    )
+
+    # ---------------- Load dataset safely ----------------
+    full_dataset = ImageFolder(root=clean_root, transform=train_t)
+    print(
+        f"✅ ImageFolder loaded successfully with {len(full_dataset)} total images"
+    )
+    print(f"Classes detected: {full_dataset.classes}")
+
+    # ---------------- 5-Fold Cross Validation with Resume ----------------
+    print(
+        f"\n🎯 Starting {n_splits}-Fold Cross Validation with ResNet-50 (resumable)..."
+    )
+
+    kfold = KFold(n_splits=n_splits, shuffle=True, random_state=42)
+
+    progress = load_progress()
+    completed_folds = progress.get("completed_folds", [])
+    fold_results = progress.get("fold_results", [])
+
+    print(f"📂 Previously completed folds: {completed_folds}")
+
+    fold_splits = list(kfold.split(full_dataset))
+
+    for fold, (train_idx, val_idx) in enumerate(fold_splits):
+        fold_num = fold + 1
+        fold_model_path = f"best_resnet50_fold{fold_num}_safe.pth"
+
+        # Skip if already completed and model exists
+        if fold_num in completed_folds and os.path.exists(fold_model_path):
+            print(f"\n⏩ Skipping Fold {fold_num} (already completed)")
+            existing = [r for r in fold_results if r["fold"] == fold_num]
+            if existing:
+                print(
+                    f"    Result: AUC={existing[0]['auc']:.4f}, Acc={existing[0]['acc']:.3f}"
+                )
+            continue
+
+        print(f"\n{'='*60}")
+        print(f"🔄 FOLD {fold_num}/{n_splits}")
+        print(f"{'='*60}")
+
+        train_subset = Subset(full_dataset, train_idx)
+        val_subset = Subset(full_dataset, val_idx)
+
+        train_subset.dataset.transform = train_t
+        val_subset.dataset.transform = val_t
+
+        # Compute per‑fold class weight from training set only
+        train_labels = [full_dataset.samples[i][1] for i in train_idx]
+        pos_count = sum(train_labels)
+        neg_count = len(train_labels) - pos_count
+        pos_weight = torch.tensor([neg_count / pos_count]).to(device)
+        print(
+            f"📊 Fold {fold_num} training class distribution: Normal={neg_count}, Glaucoma={pos_count} -> pos_weight={pos_weight.item():.3f}"
+        )
+
+        train_loader = DataLoader(
+            train_subset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=4,
+            pin_memory=True,
+        )
+        val_loader = DataLoader(
+            val_subset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=4,
+            pin_memory=True,
+        )
+
+        model = create_resnet50_model()
+
+        fold_metrics, fold_history = train_fold(
+            model,
+            train_loader,
+            val_loader,
+            fold_num,
+            pos_weight,
+            epochs,
+            lr,
+        )
+
+        fold_result = {
+            "fold": fold_num,
+            "auc": float(fold_metrics["auc"]),
+            "acc": float(fold_metrics["acc"]),
+            "sens": float(fold_metrics["sens"]),
+            "spec": float(fold_metrics["spec"]),
+        }
+
+        if fold_num not in completed_folds:
+            completed_folds.append(fold_num)
+        fold_results = [r for r in fold_results if r["fold"] != fold_num]
+        fold_results.append(fold_result)
+        progress["completed_folds"] = completed_folds
+        progress["fold_results"] = fold_results
+        save_progress(progress)
+
+        print(f"\n✅ Fold {fold_num} completed:")
+        print(
+            f"   AUC: {fold_metrics['auc']:.4f}, Acc: {fold_metrics['acc']:.3f}, "
+            f"Sens: {fold_metrics['sens']:.3f}, Spec: {fold_metrics['spec']:.3f}"
+        )
+
+    # ---------------- Cross Validation Results ----------------
+    print(f"\n{'='*80}")
+    print(f"🎯 {n_splits}-FOLD CROSS VALIDATION RESULTS - RESNET-50")
+    print(f"{'='*80}")
+
+    if not fold_results:
+        print("⚠️ No folds completed. Exiting.")
+        return
+
+    avg_auc = np.mean([r["auc"] for r in fold_results])
+    avg_acc = np.mean([r["acc"] for r in fold_results])
+    avg_sens = np.mean([r["sens"] for r in fold_results])
+    avg_spec = np.mean([r["spec"] for r in fold_results])
+
+    std_auc = np.std([r["auc"] for r in fold_results])
+    std_acc = np.std([r["acc"] for r in fold_results])
+    std_sens = np.std([r["sens"] for r in fold_results])
+    std_spec = np.std([r["spec"] for r in fold_results])
+
+    print(f"\n📊 Average Performance across {len(fold_results)} folds:")
+    print(f"🏆 AUC:        {avg_auc:.4f} ± {std_auc:.4f}")
+    print(f"🎯 Accuracy:   {avg_acc:.3f} ± {std_acc:.3f}")
+    print(f"❤️  Sensitivity: {avg_sens:.3f} ± {std_sens:.3f}")
+    print(f"🛡️  Specificity: {avg_spec:.3f} ± {std_spec:.3f}")
+
+    print(f"\n📈 Individual Fold Results:")
+    for r in fold_results:
+        print(
+            f"   Fold {r['fold']}: AUC={r['auc']:.4f}, Acc={r['acc']:.3f}, "
+            f"Sens={r['sens']:.3f}, Spec={r['spec']:.3f}"
+        )
+
+    # ---------------- Ensemble Evaluation (only if all folds complete) ----------------
+    if len(fold_results) < n_splits:
+        print(
+            f"\n⚠️ Only {len(fold_results)}/{n_splits} folds completed. Skipping ensemble evaluation."
+        )
+    else:
+        print(f"\n{'='*60}")
+        print(f"🤝 ENSEMBLE EVALUATION ACROSS ALL FOLDS")
+        print(f"{'='*60}")
+
+        n_total = len(full_dataset)
+        n_test = int(0.15 * n_total)
+        n_train_val = n_total - n_test
+        train_val_ds, test_ds = random_split(
+            full_dataset, [n_train_val, n_test]
+        )
+        test_ds.dataset.transform = val_t
+        test_loader = DataLoader(
+            test_ds, batch_size=batch_size, shuffle=False, num_workers=4
+        )
+
+        all_fold_probs = []
+
+        for fold_num in range(1, n_splits + 1):
+            model_path = f"best_resnet50_fold{fold_num}_safe.pth"
+            model = create_resnet50_model()
+
+            if safe_load_model_state_dict(model_path, model):
+                model.eval()
+                fold_probs = []
+                with torch.no_grad():
+                    for imgs, _ in test_loader:
+                        imgs = imgs.to(device)
+                        out = torch.sigmoid(
+                            model(imgs).squeeze(1)
+                        ).cpu()
+                        fold_probs.extend(out)
+                all_fold_probs.append(fold_probs)
+                print(f"✅ Fold {fold_num} loaded for ensemble prediction")
+            else:
+                print(f"❌ Could not load Fold {fold_num} for ensemble")
+
+        if all_fold_probs:
+            ensemble_probs = np.mean(np.array(all_fold_probs), axis=0)
+            test_labels = [label for _, label in test_ds]
+
+            (
+                ensemble_auc,
+                ensemble_acc,
+                ensemble_sens,
+                ensemble_spec,
+            ) = compute_metrics(test_labels, ensemble_probs)
+
+            print(f"\n🎯 ENSEMBLE TEST RESULTS:")
+            print(f"🏆 AUC:          {ensemble_auc:.4f}")
+            print(f"🎯 Accuracy:     {ensemble_acc:.3f}")
+            print(f"❤️  Sensitivity:  {ensemble_sens:.3f}")
+            print(f"🛡️  Specificity:  {ensemble_spec:.3f}")
+
+    # Save results
+    with open("resnet50_cross_validation_results.txt", "w") as f:
+        f.write(f"{n_splits}-Fold Cross Validation Results - ResNet-50\n")
+        f.write("=" * 60 + "\n")
+        f.write(f"Average AUC: {avg_auc:.4f} ± {std_auc:.4f}\n")
+        f.write(f"Average Accuracy: {avg_acc:.3f} ± {std_acc:.3f}\n")
+        f.write(f"Average Sensitivity: {avg_sens:.3f} ± {std_sens:.3f}\n")
+        f.write(f"Average Specificity: {avg_spec:.3f} ± {std_spec:.3f}\n\n")
+
+        if len(fold_results) == n_splits and all_fold_probs:
+            f.write(f"Ensemble Test Results:\n")
+            f.write(f"AUC: {ensemble_auc:.4f}\n")
+            f.write(f"Accuracy: {ensemble_acc:.3f}\n")
+            f.write(f"Sensitivity: {ensemble_sens:.3f}\n")
+            f.write(f"Specificity: {ensemble_spec:.3f}\n\n")
+
+        f.write("Individual Fold Results:\n")
+        for r in fold_results:
+            f.write(
+                f"Fold {r['fold']}: AUC={r['auc']:.4f}, Acc={r['acc']:.3f}, "
+                f"Sens={r['sens']:.3f}, Spec={r['spec']:.3f}\n"
+            )
+
+    print(
+        f"\n💾 Results saved to: resnet50_cross_validation_results.txt"
+    )
+
+    # Cleanup
+    try:
+        shutil.rmtree(clean_root)
+        print(f"🧹 Cleaned up temporary directory")
+    except:
+        pass
+
+
+# -------------------------
+if __name__ == "__main__":
+    main()
