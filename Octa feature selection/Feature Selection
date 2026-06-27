@@ -1,0 +1,312 @@
+import pandas as pd
+import numpy as np
+import statsmodels.api as sm
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy import stats
+
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegressionCV, LogisticRegression
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import roc_auc_score, accuracy_score, confusion_matrix, roc_curve, auc
+
+import warnings
+warnings.filterwarnings('ignore')
+
+# Set professional plotting aesthetics
+sns.set_theme(style="whitegrid")
+plt.rcParams.update({'font.size': 11, 'axes.labelsize': 12, 'axes.titlesize': 14})
+
+# ==========================================
+# SECTION 1: LOAD & PREPROCESS DATA
+# ==========================================
+df = pd.read_csv("cleaned_octa_data.csv")
+print(f"Loaded {len(df)} samples.\n")
+
+target = 'glaucoma'
+
+print("--- Target Distribution ---")
+counts = df[target].value_counts()
+print(f"Glaucoma cases (1): {counts.get(1, 0)}")
+print(f"Normal cases (0): {counts.get(0, 0)}\n")
+
+#Age Gender Lens status SE SPH CYL AXIS Eye ONH movt artefact
+
+exclude_exact = ['SNO', 'Date', 'ID_str', 'AXIS', 'CYL', 'ONH movt artefact', 'Eye', 'SPH', 'SE', 'Lens status', 'Gender', 'Age', target]
+exclude_list = [col for col in df.columns if col in exclude_exact or 'Unnamed' in col]
+features = [col for col in df.columns if col not in exclude_list and pd.api.types.is_numeric_dtype(df[col])]
+
+y = df[target]
+X_raw = df[features].copy()
+
+# Median imputation for missing data
+for col in X_raw.columns:
+    X_raw[col] = X_raw[col].fillna(X_raw[col].median())
+
+# ==========================================
+# SECTION 2: UNIVARIATE LOGISTIC REGRESSION
+# ==========================================
+univariate_results = []
+
+for feat in features:
+    X_single = X_raw[[feat]]
+    if X_single.var().iloc[0] < 1e-12:
+        continue
+    try:
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(X_single)
+        X_sm = sm.add_constant(X_scaled)
+        
+        model = sm.Logit(y, X_sm)
+        res = model.fit(disp=False, maxiter=1000)
+        
+        beta = res.params.iloc[1]
+        pval = res.pvalues.iloc[1]
+        conf_int = res.conf_int().iloc[1]
+        
+        or_val = np.exp(beta)
+        or_lower = np.exp(conf_int[0])
+        or_upper = np.exp(conf_int[1])
+        
+        univariate_results.append({
+            'Feature': feat,
+            'Beta': beta,
+            'Odds_Ratio': or_val,
+            '95%_CI_Lower': or_lower,
+            '95%_CI_Upper': or_upper,
+            'P_value': pval
+        })
+    except Exception:
+        continue
+
+df_uni = pd.DataFrame(univariate_results).sort_values('P_value')
+
+print("--- Section 2: Complete Univariate Logistic Regression Table ---")
+# Setting line_width to ensure wide rows don't wrap and break visualization
+print(df_uni.to_string(index=False, line_width=200, formatters={
+    'Beta': '{:.4f}'.format, 'Odds_Ratio': '{:.4f}'.format,
+    '95%_CI_Lower': '{:.4f}'.format, '95%_CI_Upper': '{:.4f}'.format, 'P_value': '{:,.4e}'.format
+}))
+df_uni.to_csv("all_univariate_logistic_results.csv", index=False)
+print("\nSaved all results to 'all_univariate_logistic_results.csv'.\n")
+
+# ==========================================
+# SECTION 3: SIGNIFICANT VARIABLES POOL (P < 0.05)
+# ==========================================
+df_sig_05 = df_uni[df_uni['P_value'] < 0.05]
+sig_features_05 = df_sig_05['Feature'].tolist()
+
+print("--- Section 3: Statistically Significant Variables (P < 0.05) ---")
+for idx, feat in enumerate(sig_features_05, 1):
+    print(f"{idx}. {feat}")
+print()
+
+# ==========================================
+# SECTION 4: LASSO FEATURE SELECTION (EXPLICIT GRID)
+# ==========================================
+X_lasso_input = X_raw[sig_features_05].copy()
+scaler_lasso = StandardScaler()
+X_lasso_scaled = scaler_lasso.fit_transform(X_lasso_input)
+
+# Define explicit 50-value grid for reproducibility
+explicit_cs = np.logspace(-4, 4, 50)
+
+lasso_cv = LogisticRegressionCV(
+    Cs=explicit_cs,
+    penalty='l1', 
+    solver='liblinear', 
+    cv=5, 
+    scoring='roc_auc', 
+    max_iter=10000, 
+    random_state=42
+)
+lasso_cv.fit(X_lasso_scaled, y)
+
+optimal_c = lasso_cv.C_[0]
+print("--- Section 4: LASSO Metrics ---")
+print(f"Optimal C selected by 5-fold CV: {optimal_c:.4f}\n")
+
+df_lasso_results = pd.DataFrame({
+    'Feature': sig_features_05,
+    'LASSO_Coefficient': lasso_cv.coef_[0]
+})
+selected_features_df = df_lasso_results[df_lasso_results['LASSO_Coefficient'] != 0].copy()
+selected_features_df['Abs_Coef'] = selected_features_df['LASSO_Coefficient'].abs()
+selected_features_df = selected_features_df.sort_values(by='Abs_Coef', ascending=False)
+
+print("--- Selected Features & Coefficients ---")
+print(selected_features_df[['Feature', 'LASSO_Coefficient']].to_string(index=False, formatters={'LASSO_Coefficient': '{:.4f}'.format}))
+selected_features_df[['Feature', 'LASSO_Coefficient']].to_csv("lasso_selected_features.csv", index=False)
+print("\nSaved chosen features to 'lasso_selected_features.csv'.\n")
+
+final_features = selected_features_df['Feature'].tolist()
+
+# --- Print Feature Reduction Summary ---
+print("--- Feature Reduction Summary ---")
+print(f"Total candidate features:      {len(features)}")
+print(f"Features with p < 0.05:         {len(sig_features_05)}")
+print(f"Features retained after LASSO:  {len(final_features)}\n")
+
+# ==========================================
+# SECTION 5 & 6: FINAL REGRESSION & EVALUATION
+# ==========================================
+X_final = X_raw[final_features].copy()
+
+cv_auc, cv_accuracy, cv_sensitivity, cv_specificity = [], [], [], []
+cv_thresholds = []
+tprs = []
+base_fpr = np.linspace(0, 1, 100)
+aggregate_cm = np.zeros((2, 2))
+
+fig_roc, ax_roc = plt.subplots(figsize=(7.5, 6))
+skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+
+print("--- Processing Cross-Validation Folds ---")
+for fold, (train_idx, test_idx) in enumerate(skf.split(X_final, y), 1):
+    X_train, X_test = X_final.iloc[train_idx], X_final.iloc[test_idx]
+    y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+    
+    # Internal scaling to block data leakage
+    scaler_final = StandardScaler()
+    X_train_scaled = scaler_final.fit_transform(X_train)
+    X_test_scaled = scaler_final.transform(X_test)
+    
+    final_lr = LogisticRegression(penalty=None, solver='lbfgs', class_weight='balanced', max_iter=10000)
+    final_lr.fit(X_train_scaled, y_train)
+    
+    # Calculate training probabilities to optimize threshold safely
+    y_train_prob = final_lr.predict_proba(X_train_scaled)[:, 1]
+    fpr_train, tpr_train, thresholds_train = roc_curve(y_train, y_train_prob)
+    
+    # Threshold Optimization strictly using Training Fold labels via Youden's Index
+    youden_index_train = tpr_train - fpr_train
+    optimal_idx_train = np.argmax(youden_index_train)
+    optimal_threshold = thresholds_train[optimal_idx_train]
+    cv_thresholds.append(optimal_threshold)
+    print(f" Fold {fold} Optimal Training Threshold: {optimal_threshold:.4f}")
+    
+    # Run predictions on the untouched validation test set
+    y_prob = final_lr.predict_proba(X_test_scaled)[:, 1]
+    y_pred = (y_prob >= optimal_threshold).astype(int)
+    
+    # Performance Evaluation
+    fold_auc = roc_auc_score(y_test, y_prob)
+    fold_acc = accuracy_score(y_test, y_pred)
+    cm = confusion_matrix(y_test, y_pred, labels=[0, 1])
+    aggregate_cm += cm
+    tn, fp, fn, tp = cm.ravel()
+    
+    cv_auc.append(fold_auc)
+    cv_accuracy.append(fold_acc)
+    cv_sensitivity.append(tp / (tp + fn) if (tp + fn) > 0 else 0)
+    cv_specificity.append(tn / (tn + fp) if (tn + fp) > 0 else 0)
+    
+    fpr, tpr, _ = roc_curve(y_test, y_prob)
+    ax_roc.plot(fpr, tpr, alpha=0.25, linestyle='--', label=f'Fold {fold} (AUC = {fold_auc:.3f})')
+    tprs.append(np.interp(base_fpr, fpr, tpr))
+    tprs[-1][0] = 0.0
+
+print(f"\n--- Section 6: 5-Fold Stratified CV Evaluation Metrics ---")
+print(f"Optimal Threshold: {np.mean(cv_thresholds):.4f} ± {np.std(cv_thresholds):.4f}")
+print(f"ROC-AUC:           {np.mean(cv_auc):.4f} ± {np.std(cv_auc):.4f}")
+print(f"Accuracy:          {np.mean(cv_accuracy):.4f} ± {np.std(cv_accuracy):.4f}")
+print(f"Sensitivity:       {np.mean(cv_sensitivity):.4f} ± {np.std(cv_sensitivity):.4f}")
+print(f"Specificity:       {np.mean(cv_specificity):.4f} ± {np.std(cv_specificity):.4f}\n")
+
+# ==========================================
+# SECTION 7: FINAL MODEL INTERPRETATION
+# ==========================================
+scaler_global = StandardScaler()
+X_global_scaled = scaler_global.fit_transform(X_final)
+X_global_sm = sm.add_constant(X_global_scaled)
+
+global_model = sm.Logit(y, X_global_sm)
+global_res = global_model.fit(disp=False, maxiter=1000)
+
+final_interpretation = []
+for i, feat in enumerate(final_features, start=1):
+    beta = global_res.params.iloc[i]
+    pval = global_res.pvalues.iloc[i]
+    conf_int = global_res.conf_int().iloc[i]
+    
+    final_interpretation.append({
+        'Feature': feat,
+        'Beta': beta,
+        'Odds_Ratio': np.exp(beta),
+        '95%_CI_Lower': np.exp(conf_int[0]),
+        '95%_CI_Upper': np.exp(conf_int[1]),
+        'P_value': pval
+    })
+
+df_final_metrics = pd.DataFrame(final_interpretation).sort_values('P_value')
+print("--- Section 7: Final Multivariable Model Parameters ---")
+print(df_final_metrics.to_string(index=False, line_width=200, formatters={
+    'Beta': '{:.4f}'.format, 'Odds_Ratio': '{:.4f}'.format,
+    '95%_CI_Lower': '{:.4f}'.format, '95%_CI_Upper': '{:.4f}'.format, 'P_value': '{:,.4e}'.format
+}))
+df_final_metrics.to_csv("final_multivariable_results.csv", index=False)
+print("\nSaved parameter interpretations to 'final_multivariable_results.csv'.\n")
+
+# ==========================================
+# SECTION 8: PUBLICATION-QUALITY FIGURES
+# ==========================================
+print("Generating publication plots in both PNG and PDF vector formats...")
+
+def save_dual_format(fig, base_filename):
+    """Helper function to save figures as both raster and journal-preferred vector format."""
+    fig.savefig(f"{base_filename}.png", dpi=300, bbox_inches='tight')
+    fig.savefig(f"{base_filename}.pdf", format='pdf', bbox_inches='tight')
+
+# Figure 1: ROC Curve
+mean_tprs = np.mean(tprs, axis=0)
+mean_tprs[-1] = 1.0
+mean_auc = auc(base_fpr, mean_tprs)
+ax_roc.plot(base_fpr, mean_tprs, color='navy', label=f'Mean ROC (AUC = {mean_auc:.4f})', lw=2.5)
+ax_roc.plot([0, 1], [0, 1], color='dimgray', linestyle=':', lw=1.5)
+ax_roc.set_xlim([-0.01, 1.01])
+ax_roc.set_ylim([-0.01, 1.01])
+ax_roc.set_xlabel('False Positive Rate (1 - Specificity)')
+ax_roc.set_ylabel('True Positive Rate (Sensitivity)')
+ax_roc.set_title('Cross-Validated ROC Curve Analysis')
+ax_roc.legend(loc='lower right', frameon=True)
+fig_roc.tight_layout()
+save_dual_format(fig_roc, 'publication_roc_curve')
+plt.close(fig_roc)
+
+# Figure 2: Confusion Matrix Heatmap
+fig_cm, ax_cm = plt.subplots(figsize=(5.5, 4.5))
+sns.heatmap(aggregate_cm, annot=aggregate_cm, fmt='g', cmap='Blues', cbar=False, ax=ax_cm,
+            xticklabels=['Normal (0)', 'Glaucoma (1)'],
+            yticklabels=['Normal (0)', 'Glaucoma (1)'])
+ax_cm.set_xlabel('Predicted Class Designation')
+ax_cm.set_ylabel('True Clinical Target')
+ax_cm.set_title('Pooled Cross-Validation Confusion Matrix')
+fig_cm.tight_layout()
+save_dual_format(fig_cm, 'publication_confusion_matrix')
+plt.close(fig_cm)
+
+# Figure 3: LASSO Coefficient Selection Map
+df_lasso_plot = df_lasso_results[df_lasso_results['LASSO_Coefficient'] != 0].sort_values(by='LASSO_Coefficient')
+fig_l, ax_l = plt.subplots(figsize=(9, 5.5))
+colors_lasso = ['crimson' if c < 0 else 'teal' for c in df_lasso_plot['LASSO_Coefficient']]
+ax_l.barh(df_lasso_plot['Feature'], df_lasso_plot['LASSO_Coefficient'], color=colors_lasso, edgecolor='black', height=0.6)
+ax_l.axvline(0, color='black', linewidth=1, linestyle='-')
+ax_l.set_xlabel('LASSO Regularization Weights')
+ax_l.set_title('Feature Reduction Output (L1 Active Penalty)')
+fig_l.tight_layout()
+save_dual_format(fig_l, 'publication_lasso_coef_plot')
+plt.close(fig_l)
+
+# Figure 4: Final Multivariable Coefficient Impact Bar Chart
+df_final_plot = df_final_metrics.sort_values(by='Beta')
+fig_f, ax_f = plt.subplots(figsize=(9, 5.5))
+colors_final = ['firebrick' if b < 0 else 'seagreen' for b in df_final_plot['Beta']]
+ax_f.barh(df_final_plot['Feature'], df_final_plot['Beta'], color=colors_final, edgecolor='black', height=0.6)
+ax_f.axvline(0, color='black', linewidth=1, linestyle='-')
+ax_f.set_xlabel('Unpenalized Standardized Beta Coefficients')
+ax_f.set_title('Final Multivariable Predictor Rankings')
+fig_f.tight_layout()
+save_dual_format(fig_f, 'publication_final_coef_plot')
+plt.close(fig_f)
+
+print("All pipeline tasks successfully complete! CSV tables and dual-format (.png / .pdf) vector plots are ready.")
