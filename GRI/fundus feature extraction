@@ -1,0 +1,351 @@
+# ============================================
+# BLOCK 2 — FINAL FUNDUS FEATURE EXTRACTION
+# ============================================
+
+import os
+import cv2
+import numpy as np
+import pandas as pd
+
+from tqdm import tqdm
+
+from skimage.morphology import (
+    remove_small_objects,
+    closing,
+    disk,
+    skeletonize
+)
+
+# ============================================
+# FRACTAL DIMENSION
+# ============================================
+
+def fractal_dimension(Z):
+
+    Z = (Z > 0)
+
+    sizes = 2 ** np.arange(1, 8)
+
+    counts = []
+
+    for size in sizes:
+
+        count = 0
+
+        for i in range(0, Z.shape[0], size):
+
+            for j in range(0, Z.shape[1], size):
+
+                patch = Z[i:i+size, j:j+size]
+
+                if np.any(patch):
+
+                    count += 1
+
+        counts.append(count)
+
+    coeffs = np.polyfit(
+        np.log(sizes),
+        np.log(counts),
+        1
+    )
+
+    return -coeffs[0]
+
+# ============================================
+# EXTRACT FEATURES
+# ============================================
+
+def extract_features(image_path):
+
+    try:
+
+        # =====================================
+        # LOAD IMAGE
+        # =====================================
+
+        img = cv2.imread(image_path)
+
+        if img is None:
+            return None
+
+        # =====================================
+        # RESIZE
+        # =====================================
+
+        img = cv2.resize(
+            img,
+            (512, 512)
+        )
+
+        # =====================================
+        # GREEN CHANNEL EXTRACTION
+        # =====================================
+
+        green = img[:, :, 1]
+
+        # =====================================
+        # CLAHE ENHANCEMENT
+        # =====================================
+
+        clahe = cv2.createCLAHE(
+            clipLimit=2.0,
+            tileGridSize=(8,8)
+        )
+
+        enhanced = clahe.apply(green)
+
+        # =====================================
+        # GAUSSIAN BLUR
+        # =====================================
+
+        blurred = cv2.GaussianBlur(
+            enhanced,
+            (5,5),
+            0
+        )
+
+        # =====================================
+        # ADAPTIVE THRESHOLDING
+        # =====================================
+
+        binary = cv2.adaptiveThreshold(
+
+            blurred,
+
+            255,
+
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+
+            cv2.THRESH_BINARY_INV,
+
+            15,
+            5
+
+        )
+
+        # =====================================
+        # CONVERT TO BOOLEAN
+        # =====================================
+
+        binary = binary > 0
+
+        # =====================================
+        # REMOVE SMALL OBJECTS
+        # =====================================
+
+        binary = remove_small_objects(
+            binary,
+            min_size=80
+        )
+
+        # =====================================
+        # MORPHOLOGICAL CLOSING
+        # =====================================
+
+        binary = closing(
+            binary,
+            disk(2)
+        )
+
+        # =====================================
+        # SKELETONIZATION
+        # =====================================
+
+        skeleton = skeletonize(binary)
+
+        # =====================================
+        # IMAGE AREA
+        # =====================================
+
+        image_area = (
+            skeleton.shape[0]
+            *
+            skeleton.shape[1]
+        )
+
+        # =====================================
+        # VSL
+        # =====================================
+
+        vessel_pixels = np.sum(skeleton)
+
+        vsl = vessel_pixels / image_area
+
+        # =====================================
+        # TORTUOSITY
+        # =====================================
+
+        contours, _ = cv2.findContours(
+
+            binary.astype(np.uint8),
+
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_NONE
+
+        )
+
+        tortuosities = []
+
+        for cnt in contours:
+
+            if len(cnt) < 10:
+                continue
+
+            perimeter = cv2.arcLength(
+                cnt,
+                closed=False
+            )
+
+            x, y, w, h = cv2.boundingRect(cnt)
+
+            straight_distance = np.sqrt(
+                w**2 + h**2
+            )
+
+            if straight_distance > 0:
+
+                tort = (
+                    perimeter / straight_distance
+                )
+
+                tortuosities.append(tort)
+
+        if len(tortuosities) > 0:
+
+            tort = np.mean(tortuosities)
+
+        else:
+
+            tort = 0
+
+        # =====================================
+        # FRACTAL DIMENSION
+        # =====================================
+
+        fd = fractal_dimension(skeleton)
+
+        # =====================================
+        # FDI
+        # =====================================
+
+        vessel_area = np.sum(binary)
+
+        non_vessel_area = (
+            image_area - vessel_area
+        )
+
+        fdi = non_vessel_area / image_area
+
+        return vsl, tort, fd, fdi
+
+    except Exception as e:
+
+        print(f"\nError processing: {image_path}")
+        print(e)
+
+        return None
+
+# ============================================
+# RUN FEATURE EXTRACTION
+# ============================================
+
+dataset_path = "Dataset"
+
+results = []
+
+all_images = []
+
+for class_name in ["Glaucoma", "Normal"]:
+
+    folder = os.path.join(
+        dataset_path,
+        class_name
+    )
+
+    for file in os.listdir(folder):
+
+        if file.endswith((".png", ".jpg", ".jpeg")):
+
+            all_images.append(
+                (class_name, folder, file)
+            )
+
+print(f"\nTotal Images Found: {len(all_images)}")
+
+# ============================================
+# PROCESS ALL IMAGES
+# ============================================
+
+for class_name, folder, file in tqdm(
+
+    all_images,
+
+    desc="Extracting Fundus Features"
+
+):
+
+    path = os.path.join(folder, file)
+
+    try:
+
+        patient_id = int(
+            file.split("_")[0]
+        )
+
+    except:
+        continue
+
+    features = extract_features(path)
+
+    if features is None:
+        continue
+
+    vsl, tort, fd, fdi = features
+
+    results.append({
+
+        "SNO": patient_id,
+
+        "VSL": vsl,
+
+        "TORT": tort,
+
+        "FD": fd,
+
+        "FDI": fdi,
+
+        "Label": class_name
+
+    })
+
+# ============================================
+# CREATE DATAFRAME
+# ============================================
+
+fundus_df = pd.DataFrame(results)
+
+# ============================================
+# SAVE
+# ============================================
+
+fundus_df.to_csv(
+    "fundus_features.csv",
+    index=False
+)
+
+# ============================================
+# SUMMARY
+# ============================================
+
+print("\n===================================")
+print("FUNDUS FEATURE EXTRACTION COMPLETE")
+print("===================================")
+
+print("\nExtracted Samples:", len(fundus_df))
+
+print("\nColumns:")
+print(fundus_df.columns.tolist())
+
+print("\nFirst 5 Rows:")
+print(fundus_df.head())
