@@ -1,0 +1,34 @@
+import glob
+from PIL import Image
+import matplotlib.pyplot as plt
+
+normal_files = sorted(glob.glob("gradcam_normal_*.png"))
+glaucoma_files = sorted(glob.glob("gradcam_glaucoma_*.png"))
+
+# --------------------------
+# Normal examples
+# --------------------------
+fig, axes = plt.subplots(1, len(normal_files), figsize=(20,5))
+
+for ax, file in zip(axes, normal_files):
+    ax.imshow(Image.open(file))
+    ax.set_title(file.replace(".png",""), fontsize=9)
+    ax.axis("off")
+
+plt.suptitle("Representative Normal Grad-CAMs", fontsize=16, fontweight="bold")
+plt.tight_layout()
+plt.show()
+
+# --------------------------
+# Glaucoma examples
+# --------------------------
+fig, axes = plt.subplots(1, len(glaucoma_files), figsize=(20,5))
+
+for ax, file in zip(axes, glaucoma_files):
+    ax.imshow(Image.open(file))
+    ax.set_title(file.replace(".png",""), fontsize=9)
+    ax.axis("off")
+
+plt.suptitle("Representative Glaucoma Grad-CAMs", fontsize=16, fontweight="bold")
+plt.tight_layout()
+plt.show()
