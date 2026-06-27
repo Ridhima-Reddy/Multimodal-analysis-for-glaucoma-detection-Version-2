@@ -1,0 +1,256 @@
+# ============================================
+# AUTO-SELECT BEST NORMAL & GLAUCOMA EXAMPLES
+# VISUALIZE FUNDUS PROCESSING PIPELINE
+# ============================================
+
+import os
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+
+from skimage.morphology import (
+    remove_small_objects,
+    closing,
+    disk,
+    skeletonize
+)
+
+# ============================================
+# PROCESS IMAGE FUNCTION
+# ============================================
+
+def process_image(image_path):
+
+    img = cv2.imread(image_path)
+
+    if img is None:
+        return None
+
+    img = cv2.resize(
+        img,
+        (512, 512)
+    )
+
+    # GREEN CHANNEL
+    green = img[:, :, 1]
+
+    # CLAHE
+    clahe = cv2.createCLAHE(
+        clipLimit=2.0,
+        tileGridSize=(8,8)
+    )
+
+    enhanced = clahe.apply(green)
+
+    # GAUSSIAN BLUR
+    blurred = cv2.GaussianBlur(
+        enhanced,
+        (5,5),
+        0
+    )
+
+    # ADAPTIVE THRESHOLDING
+    binary = cv2.adaptiveThreshold(
+        blurred,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        15,
+        5
+    )
+
+    # BOOLEAN CONVERSION
+    binary_bool = binary > 0
+
+    # REMOVE SMALL OBJECTS
+    binary_clean = remove_small_objects(
+        binary_bool,
+        min_size=80
+    )
+
+    # MORPHOLOGICAL CLOSING
+    binary_clean = closing(
+        binary_clean,
+        disk(2)
+    )
+
+    # SKELETONIZATION
+    skeleton = skeletonize(binary_clean)
+
+    # ========================================
+    # COMPUTE SIMPLE VESSEL DENSITY SCORE
+    # ========================================
+
+    vessel_density = np.sum(skeleton)
+
+    return {
+        "img": img,
+        "binary": binary_clean,
+        "skeleton": skeleton,
+        "density": vessel_density,
+        "path": image_path
+    }
+
+# ============================================
+# FIND MOST REPRESENTATIVE IMAGES
+# ============================================
+
+dataset_path = "Dataset"
+
+selected_examples = {}
+
+for class_name in ["Normal", "Glaucoma"]:
+
+    folder = os.path.join(
+        dataset_path,
+        class_name
+    )
+
+    processed_images = []
+
+    for file in os.listdir(folder):
+
+        if file.endswith((".png", ".jpg", ".jpeg")):
+
+            path = os.path.join(folder, file)
+
+            result = process_image(path)
+
+            if result is not None:
+
+                processed_images.append(result)
+
+    # ========================================
+    # SORT BY VESSEL DENSITY
+    # ========================================
+
+    processed_images = sorted(
+        processed_images,
+        key=lambda x: x["density"]
+    )
+
+    # ========================================
+    # PICK REPRESENTATIVE EXAMPLES
+    # ========================================
+
+    
+    densities = [x["density"] for x in processed_images]
+    
+    if class_name == "Glaucoma":
+    
+        # Choose moderately low density example
+        target_density = np.percentile(densities, 25)
+    
+        selected_examples[class_name] = min(
+            processed_images,
+            key=lambda x: abs(x["density"] - target_density)
+        )
+    
+    else:
+    
+        # Choose moderately high density example
+        target_density = np.percentile(densities, 75)
+    
+        selected_examples[class_name] = min(
+            processed_images,
+            key=lambda x: abs(x["density"] - target_density)
+        )
+
+
+# ============================================
+# CREATE FIGURE
+# ============================================
+
+fig, axes = plt.subplots(
+    2,
+    3,
+    figsize=(12,8)
+)
+
+for row, class_name in enumerate(["Normal", "Glaucoma"]):
+
+    example = selected_examples[class_name]
+
+    img = example["img"]
+    binary_clean = example["binary"]
+    skeleton = example["skeleton"]
+
+    # ----------------------------------------
+    # ORIGINAL IMAGE
+    # ----------------------------------------
+
+    axes[row, 0].imshow(
+        cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    )
+
+    axes[row, 0].set_title(
+        f"{class_name}: Original"
+    )
+
+    axes[row, 0].axis("off")
+
+    # ----------------------------------------
+    # BINARY MASK
+    # ----------------------------------------
+
+    axes[row, 1].imshow(
+        binary_clean,
+        cmap="gray"
+    )
+
+    axes[row, 1].set_title(
+        "Binary Vessel Mask"
+    )
+
+    axes[row, 1].axis("off")
+
+    # ----------------------------------------
+    # SKELETON
+    # ----------------------------------------
+
+    axes[row, 2].imshow(
+        skeleton,
+        cmap="gray"
+    )
+
+    axes[row, 2].set_title(
+        "Skeletonized Vasculature"
+    )
+
+    axes[row, 2].axis("off")
+
+# ============================================
+# CLEAN LAYOUT
+# ============================================
+
+plt.tight_layout()
+
+# =========================================asa===
+# SAVE FIGURE
+# ============================================
+a
+plt.savefig(
+    "fundus_pipeline_visualization.png",
+    dpi=300,
+    bbox_inches="tight"
+)
+
+plt.show()
+
+# ============================================
+# PRINT SELECTED FILES
+# ============================================
+
+print("\n===================================")
+print("SELECTED REPRESENTATIVE IMAGES")
+print("===================================")
+
+for class_name in selected_examples:
+
+    print(
+        f"{class_name}:",
+        selected_examples[class_name]["path"]
+    )
+
+print("\n✅ Figure saved:")
+print("fundus_pipeline_visualization.png")
