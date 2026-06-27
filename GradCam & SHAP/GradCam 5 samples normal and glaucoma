@@ -1,0 +1,259 @@
+# ==============================================================================
+# BLOCK 1: GRAD-CAM (IMAGE BRANCH EXPLANATION)
+# ==============================================================================
+import torchvision.transforms as T
+from torchvision.datasets import ImageFolder
+import torchvision.models as models
+import torch.nn as nn
+from PIL import Image
+import numpy as np
+import os
+import torch
+import cv2
+import matplotlib.pyplot as plt
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Undo ImageNet normalization for visualization
+def unnormalize(img_tensor):
+    img = img_tensor.clone().cpu()
+
+    mean = torch.tensor([0.485, 0.456, 0.406]).view(3,1,1)
+    std  = torch.tensor([0.229, 0.224, 0.225]).view(3,1,1)
+
+    img = img * std + mean
+    img = torch.clamp(img, 0, 1)
+
+    return img.permute(1,2,0).numpy()
+    
+def run_stage1_gradcam():
+    print("\n" + "="*50 + "\nSTARTING GRAD-CAM EXPLANATION GENERATION\n" + "="*50)
+    
+    # 1. Reconstruct configuration and load best checkpoint (threshold 0.45)
+    IMAGE_DATA_DIR = "Dataset"
+    STAGE1_MODEL_PATH = "best_enhanced_resnet18.pth"
+    
+    
+    # Load fundus dataset using the same preprocessing as Stage 1 training
+    val_transform = T.Compose([
+        T.Resize((224,224)),
+        T.ToTensor(),
+        T.Normalize(
+            [0.485,0.456,0.406],
+            [0.229,0.224,0.225]
+        )
+    ])
+    
+    dataset = ImageFolder(
+        root="Dataset",
+        transform=val_transform
+    )
+    
+    model = models.resnet18(weights=None)
+    
+    model.fc = nn.Sequential(
+        nn.Dropout(0.2),
+        nn.Linear(model.fc.in_features, 1)
+    )
+    
+    model.load_state_dict(torch.load(STAGE1_MODEL_PATH, map_location=device))
+    
+    model.to(device)
+    model.eval()
+
+    # =====================================================
+    # Select representative correctly classified patients
+    # (70th percentile confidence)
+    # =====================================================
+    
+    normal_cases = []
+    glaucoma_cases = []
+    
+    for idx in range(len(dataset)):
+    
+        img, label = dataset[idx]
+        img = img.unsqueeze(0).to(device)
+    
+        with torch.no_grad():
+            logits = model(img)
+            prob = torch.sigmoid(logits.squeeze()).item()
+    
+        normal_label = dataset.class_to_idx["Normal"]
+        glaucoma_label = dataset.class_to_idx["Glaucoma"]
+        
+        pred = glaucoma_label if prob >= 0.5 else normal_label
+    
+        # Keep only correctly classified images
+        if pred == label:
+    
+            if label == dataset.class_to_idx["Normal"]:
+                normal_cases.append((idx, prob))
+            
+            elif label == dataset.class_to_idx["Glaucoma"]:
+                glaucoma_cases.append((idx, prob))
+                
+    
+    if len(normal_cases) == 0 or len(glaucoma_cases) == 0:
+        raise RuntimeError("No correctly classified representative cases found.")
+    
+    # Sort by confidence
+    # Pick five representative samples around the median
+
+    normal_cases.sort(key=lambda x: x[1])
+    glaucoma_cases.sort(key=lambda x: x[1])
+    
+    mid_n = len(normal_cases)//2
+    mid_g = len(glaucoma_cases)//2
+    
+    normal_examples = normal_cases[max(0,mid_n-2):mid_n+3]
+    glaucoma_examples = glaucoma_cases[max(0,mid_g-2):mid_g+3]
+    
+    cases = []
+    
+    for idx, prob in normal_examples:
+        cases.append(("normal", idx, prob))
+    
+    for idx, prob in glaucoma_examples:
+        cases.append(("glaucoma", idx, prob))
+    
+    print("\nSelected representative examples")
+    
+    for c in cases:
+        print(c)
+    
+    # 3. Execution of Grad-CAM loop
+    for sample_no, (case_name, dataset_idx, probability) in enumerate(cases):
+        if dataset_idx is None:
+            print(f"Could not find a valid validation case for {case_name}. Skipping.")
+            continue
+            
+        # Get raw data mapping back to the original file path
+        img_path, label_val = dataset.samples[dataset_idx]
+
+        print(f"\n{case_name.upper()}")
+
+        print("Image :", img_path)
+        
+        print("Probability :", probability)
+        
+        # Load unnormalized input for presentation and extraction matching
+        img_tensor, _ = dataset[dataset_idx]
+        
+        img_np = unnormalize(img_tensor)
+        
+        img_tensor = img_tensor.unsqueeze(0).to(device)
+        
+        with torch.no_grad():
+        
+            logits = model(img_tensor)
+        
+            prob = torch.sigmoid(logits.squeeze()).item()
+
+        # Attempt Grad-CAM execution using pytorch-grad-cam library, fallback dynamically if missing
+        try:
+            from pytorch_grad_cam import GradCAM
+            from pytorch_grad_cam.utils.image import show_cam_on_image
+            from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
+            
+            target_layers = [model.layer3[-1]]
+            
+            cam = GradCAM(
+                model=model,
+                target_layers=target_layers
+            )
+            
+            # ---------------------------------------
+            # Binary classification target
+            # ---------------------------------------
+            
+            targets = [ClassifierOutputTarget(0)]
+            grayscale_cam = cam(
+                input_tensor=img_tensor,
+                targets=targets
+            )[0]
+            
+            overlay = show_cam_on_image(
+                img_np,
+                grayscale_cam,
+                use_rgb=True
+            )
+            heatmap = cv2.applyColorMap(np.uint8(255 * grayscale_cam), cv2.COLORMAP_JET)
+            heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB) / 255.0
+
+        except ImportError:
+            # Manual vanilla Grad-CAM structural fallback implementation
+            features = []
+            gradients = []
+
+            def forward_hook(module, input, output):
+                features.append(output)
+
+            def backward_hook(module, grad_input, grad_output):
+                gradients.append(grad_output[0])
+
+            target_layer = model.layer3[-1]
+            h1 = target_layer.register_forward_hook(forward_hook)
+            h2 = target_layer.register_backward_hook(backward_hook)
+
+            # Execution block with targeted evaluation logic isolation
+            model.zero_grad()
+            img_tensor.requires_grad_(True)
+            output = model(img_tensor)
+            
+            output.squeeze().backward()
+
+            h1.remove()
+            h2.remove()
+
+            # Generate target activations and localized map construction
+            acts = features[0].detach().cpu().numpy()[0]
+            grads = gradients[0].detach().cpu().numpy()[0]
+
+            weights = np.mean(grads, axis=(1, 2))
+            cam_map = np.zeros(acts.shape[1:], dtype=np.float32)
+            for i, w in enumerate(weights):
+                cam_map += w * acts[i]
+
+            cam_map = np.maximum(cam_map, 0)
+            if np.max(cam_map) > 0:
+                cam_map = cam_map / np.max(cam_map)
+            grayscale_cam = cv2.resize(cam_map, (224, 224))
+            
+            # Setup final display artifacts
+            heatmap = cv2.applyColorMap(np.uint8(255 * grayscale_cam), cv2.COLORMAP_JET)
+            heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB) / 255.0
+            overlay = heatmap * 0.4 + img_np * 0.6
+            overlay = np.clip(overlay, 0, 1)
+            overlay = np.uint8(255 * overlay)
+
+        # Plot output setup using publication standard structures (300 DPI)
+        fig, axes = plt.subplots(1, 3, figsize=(15, 5), dpi=300)
+        
+        axes[0].imshow(img_np)
+        axes[0].set_title("Original Image", fontsize=12, fontweight='bold')
+        axes[0].axis('off')
+        
+        axes[1].imshow(grayscale_cam, cmap='jet')
+        axes[1].set_title("Grad-CAM Heatmap", fontsize=12, fontweight='bold')
+        axes[1].axis('off')
+        
+        axes[2].imshow(overlay)
+        axes[2].set_title("Overlay Visual", fontsize=12, fontweight='bold')
+        axes[2].axis('off')
+        
+        plt.suptitle(
+            f"{case_name.upper()} | "
+            f"True Label: {int(label_val)} | "
+            f"Predicted Probability: {prob:.3f}",
+            fontsize=14,
+            fontweight="bold",
+            y=0.95
+        )
+        plt.tight_layout()
+        
+        output_filename = f"gradcam_{case_name}_{sample_no+1}.png"
+        plt.savefig(output_filename, bbox_inches='tight', dpi=300)
+        plt.close()
+        print(f"Successfully generated and saved: {output_filename}")
+
+run_stage1_gradcam()
