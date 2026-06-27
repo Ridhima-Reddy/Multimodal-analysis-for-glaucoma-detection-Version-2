@@ -1,0 +1,658 @@
+# ============================================
+# FINAL GRI — TRUE ROC-BASED VERSION
+# ============================================
+
+import pandas as pd
+import numpy as np
+
+from scipy.stats import ttest_ind
+
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression, LogisticRegressionCV
+
+from sklearn.metrics import (
+    roc_auc_score,
+    roc_curve
+)
+
+import matplotlib.pyplot as plt
+
+# ============================================
+# LOAD DATA
+# ============================================
+
+df = pd.read_csv(
+    "final_engineered_glaucoma_dataset.csv"
+)
+
+# ============================================
+# FINAL BIOMARKERS
+# ============================================
+
+feature_cols = [
+
+    "AI",
+    "SI_ratio",
+    "STOT_ratio",
+    "VT",
+    "SIA",
+    "GAI",
+    "PTR",
+    "FRC",
+    "VSL",
+    "FDI"
+
+]
+
+# ============================================
+# NUMERIC CONVERSION
+# ============================================
+
+for col in feature_cols:
+
+    df[col] = pd.to_numeric(
+        df[col],
+        errors="coerce"
+    )
+
+# ============================================
+# DROP NaNs
+# ============================================
+
+df = df.dropna(
+    subset=feature_cols + ["Label"]
+)
+
+print("\nRemaining samples:", len(df))
+
+# ============================================
+# X / y
+# ============================================
+
+X = df[feature_cols]
+
+y = df["Label"]
+
+# ============================================
+# STANDARDIZATION
+# ============================================
+
+scaler = StandardScaler()
+
+X_scaled = scaler.fit_transform(X)
+
+X_scaled_df = pd.DataFrame(
+    X_scaled,
+    columns=feature_cols
+)
+
+# ============================================
+# FINAL LOGISTIC MODEL
+# ============================================
+
+model = LogisticRegression(
+
+    penalty=None,
+
+    solver="lbfgs",
+
+    class_weight="balanced",
+
+    max_iter=5000,
+
+    random_state=42
+
+)
+
+model.fit(
+    X_scaled,
+    y
+)
+
+# ============================================
+# COEFFICIENTS
+# ============================================
+
+coefs = model.coef_[0]
+
+selected_df = pd.DataFrame({
+
+    "Feature": feature_cols,
+
+    "Coefficient": coefs
+
+})
+
+
+# ============================================
+# AUTOMATIC POINT SCALING
+# ============================================
+
+min_abs_coef = np.min(
+    np.abs(
+        selected_df["Coefficient"]
+    )
+)
+
+selected_df["GRI_Points"] = np.round(
+
+    (
+        selected_df["Coefficient"]
+        /
+        min_abs_coef
+    )
+
+    * 2
+
+).astype(int)
+
+# ============================================
+# ENSURE NO ZERO WEIGHTS
+# ============================================
+
+selected_df.loc[
+    (
+        (selected_df["GRI_Points"] == 0)
+        &
+        (selected_df["Coefficient"] > 0)
+    ),
+    "GRI_Points"
+] = 1
+
+selected_df.loc[
+    (
+        (selected_df["GRI_Points"] == 0)
+        &
+        (selected_df["Coefficient"] < 0)
+    ),
+    "GRI_Points"
+] = -1
+
+# ============================================
+# COMMENTS
+# ============================================
+
+def interpret_coef(x):
+
+    if x > 0.75:
+
+        return "Strong positive contribution"
+
+    elif x > 0:
+
+        return "Positive contribution"
+
+    elif x < -0.75:
+
+        return "Strong negative contribution"
+
+    else:
+
+        return "Negative contribution"
+
+selected_df["Comment"] = selected_df[
+    "Coefficient"
+].apply(interpret_coef)
+
+# ============================================
+# PRINT FEATURE TABLE
+# ============================================
+
+print("\n===================================")
+print("FINAL FEATURE TABLE")
+print("===================================\n")
+
+print(selected_df)
+
+# ============================================
+# COMPUTE RAW GRI SCORE
+# ============================================
+
+gri_raw = np.zeros(len(df))
+
+for feat, points in zip(
+
+    selected_df["Feature"],
+
+    selected_df["GRI_Points"]
+
+):
+
+    gri_raw += (
+
+        X_scaled_df[feat]
+        *
+        points
+
+    )
+
+df["GRI_raw"] = gri_raw
+
+print(df["GRI_raw"].describe())
+
+# ============================================
+# ROBUST SCALE TO 0–20
+# ============================================
+
+lower = df["GRI_raw"].quantile(0.01)
+upper = df["GRI_raw"].quantile(0.99)
+
+scaled = (
+
+    (df["GRI_raw"] - lower)
+
+    /
+
+    (upper - lower)
+
+)
+
+scaled = scaled.clip(0, 1)
+
+df["GRI_Score"] = scaled * 20
+
+print(df["GRI_Score"].describe())
+
+# ============================================
+# FINAL AUC
+# ============================================
+
+final_auc = roc_auc_score(
+
+    y,
+
+    df["GRI_Score"]
+
+)
+
+print("\n===================================")
+print("FINAL PERFORMANCE")
+print("===================================\n")
+
+print(f"Final GRI AUC: {final_auc:.4f}")
+
+# ============================================
+# ROC CURVE
+# ============================================
+
+fpr, tpr, thresholds = roc_curve(
+
+    y,
+
+    df["GRI_Score"]
+
+)
+
+specificity = 1 - fpr
+
+# ============================================
+# SENSITIVITY ANALYSIS OF PPV / NPV THRESHOLDS
+# ============================================
+
+npv_targets = [0.90, 0.925, 0.95]
+ppv_targets = [0.85, 0.90, 0.95]
+
+print("\n" + "="*110)
+print("PPV / NPV THRESHOLD COMPARISON")
+print("="*110)
+
+print(
+    f"{'NPV':<6}"
+    f"{'PPV':<6}"
+    f"{'LowThr':<10}"
+    f"{'HighThr':<10}"
+    f"{'Low(n)':<10}"
+    f"{'Med(n)':<10}"
+    f"{'High(n)':<10}"
+    f"{'Low%':<10}"
+    f"{'Med%':<10}"
+    f"{'High%':<10}"
+)
+
+print("-"*110)
+
+for TARGET_NPV in npv_targets:
+
+    for TARGET_PPV in ppv_targets:
+
+        thresholds = np.sort(df["GRI_Score"].unique())
+
+        best_low = None
+        best_high = None
+
+        # -------------------------
+        # LOW THRESHOLD (NPV)
+        # -------------------------
+
+        for thresh in thresholds:
+
+            pred_low = df["GRI_Score"] < thresh
+
+            TN = ((pred_low) & (df["Label"] == 0)).sum()
+            FN = ((pred_low) & (df["Label"] == 1)).sum()
+
+            if TN + FN == 0:
+                continue
+
+            npv = TN / (TN + FN)
+
+            if npv >= TARGET_NPV:
+                best_low = thresh
+
+        # -------------------------
+        # HIGH THRESHOLD (PPV)
+        # -------------------------
+
+        for thresh in thresholds:
+
+            pred_high = df["GRI_Score"] >= thresh
+
+            TP = ((pred_high) & (df["Label"] == 1)).sum()
+            FP = ((pred_high) & (df["Label"] == 0)).sum()
+
+            if TP + FP == 0:
+                continue
+
+            ppv = TP / (TP + FP)
+
+            if ppv >= TARGET_PPV:
+                best_high = thresh
+                break
+
+        if best_low is None or best_high is None:
+            continue
+
+        # -------------------------
+        # Assign groups
+        # -------------------------
+
+        low = df[df["GRI_Score"] < best_low]
+
+        med = df[
+            (df["GRI_Score"] >= best_low)
+            &
+            (df["GRI_Score"] < best_high)
+        ]
+
+        high = df[df["GRI_Score"] >= best_high]
+
+        low_pct = low["Label"].mean()*100 if len(low)>0 else 0
+        med_pct = med["Label"].mean()*100 if len(med)>0 else 0
+        high_pct = high["Label"].mean()*100 if len(high)>0 else 0
+
+        print(
+            f"{TARGET_NPV:<6.3f}"
+            f"{TARGET_PPV:<6.3f}"
+            f"{best_low:<10.2f}"
+            f"{best_high:<10.2f}"
+            f"{len(low):<10}"
+            f"{len(med):<10}"
+            f"{len(high):<10}"
+            f"{low_pct:<10.1f}"
+            f"{med_pct:<10.1f}"
+            f"{high_pct:<10.1f}"
+        )
+
+# ============================================
+# ASSIGN RISK CATEGORY
+# ============================================
+
+def assign_risk(score):
+
+    if score < low_thresh:
+
+        return "Low"
+
+    elif score < high_thresh:
+
+        return "Medium"
+
+    else:
+
+        return "High"
+
+df["Risk_Category"] = df[
+    "GRI_Score"
+].apply(assign_risk)
+
+# ============================================
+# RISK DISTRIBUTION
+# ============================================
+
+print("\n===================================")
+print("RISK DISTRIBUTION")
+print("===================================\n")
+
+summary = pd.crosstab(
+
+    df["Risk_Category"],
+
+    df["Label"]
+
+)
+
+print(summary)
+
+# ============================================
+# GLAUCOMA %
+# ============================================
+
+print("\n===================================")
+print("GLAUCOMA PERCENTAGES")
+print("===================================\n")
+
+for category in ["High", "Medium", "Low"]:
+
+    subset = df[
+        df["Risk_Category"] == category
+    ]
+
+    glaucoma_pct = (
+        subset["Label"].mean() * 100
+    )
+
+    print(
+
+        f"{category:10s}: "
+
+        f"{glaucoma_pct:.1f}% glaucoma "
+
+        f"(n={len(subset)})"
+
+    )
+
+# ============================================
+# SAVE
+# ============================================
+
+selected_df.to_csv(
+    "GRI_feature_table.csv",
+    index=False
+)
+
+df.to_csv(
+    "GRI_results.csv",
+    index=False
+)
+
+summary.to_csv(
+    "GRI_risk_summary.csv"
+)
+
+print("\n✅ FINAL ROC-BASED GRI GENERATED")
+
+# ============================================
+# FIGURE 1 — DISTRIBUTION
+# ============================================
+
+glaucoma = df[
+    df["Label"] == 1
+]["GRI_Score"]
+
+normal = df[
+    df["Label"] == 0
+]["GRI_Score"]
+
+plt.figure(figsize=(7,5))
+
+plt.hist(
+
+    glaucoma,
+
+    bins=20,
+
+    alpha=0.6,
+
+    density=True,
+
+    label="Glaucoma"
+
+)
+
+plt.hist(
+
+    normal,
+
+    bins=20,
+
+    alpha=0.6,
+
+    density=True,
+
+    label="Normal"
+
+)
+
+plt.xlabel("GRI Score")
+
+plt.ylabel("Density")
+
+plt.title("Risk Score Distribution")
+
+plt.legend()
+
+plt.tight_layout()
+
+plt.savefig(
+    "FIGURE1_Distribution.png",
+    dpi=300
+)
+
+plt.show()
+
+# ============================================
+# FIGURE 2 — BOXPLOT
+# ============================================
+
+plt.figure(figsize=(7,5))
+
+categories = ["High", "Medium", "Low"]
+
+data_to_plot = []
+
+for cat in categories:
+
+    data_to_plot.append(
+
+        df[
+            df["Risk_Category"] == cat
+        ]["GRI_Score"]
+
+    )
+
+plt.boxplot(
+
+    data_to_plot,
+
+    tick_labels=categories
+
+)
+
+plt.ylabel("GRI Score")
+
+plt.title("Risk Stratification")
+
+plt.tight_layout()
+
+plt.savefig(
+    "FIGURE2_Boxplot.png",
+    dpi=300
+)
+
+plt.show()
+
+# ============================================
+# FIGURE 3 — FEATURE CONTRIBUTION
+# ============================================
+
+plt.figure(figsize=(8,5))
+
+plt.bar(
+
+    selected_df["Feature"],
+
+    selected_df["GRI_Points"]
+
+)
+
+plt.ylabel("GRI Points")
+
+plt.title("Feature Contribution to GRI")
+
+plt.xticks(rotation=45)
+
+plt.tight_layout()
+
+plt.savefig(
+    "FIGURE3_FeatureContribution.png",
+    dpi=300
+)
+
+plt.show()
+
+# ============================================
+# FIGURE 4 — ROC CURVE
+# ============================================
+
+plt.figure(figsize=(6,6))
+
+plt.plot(
+
+    fpr,
+
+    tpr,
+
+    label=f"AUC = {final_auc:.3f}"
+
+)
+
+plt.plot(
+
+    [0,1],
+
+    [0,1],
+
+    linestyle="--"
+
+)
+
+plt.xlabel("False Positive Rate")
+
+plt.ylabel("True Positive Rate")
+
+plt.title("ROC Curve")
+
+plt.legend(loc="lower right")
+
+plt.tight_layout()
+
+plt.savefig(
+    "FIGURE4_ROC.png",
+    dpi=300
+)
+
+plt.show()
+
+print("\n✅ ALL FIGURES GENERATED")
+print("✅ PNG files saved")
+print("✅ CSV tables saved")
