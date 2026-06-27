@@ -1,0 +1,247 @@
+# Selecting important indices from the 20 engineered indices to compute GRI
+
+import pandas as pd
+import numpy as np
+
+from scipy.stats import ttest_ind
+
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression, LogisticRegressionCV
+
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import roc_auc_score
+
+# ============================================
+# LOAD DATA
+# ============================================
+
+df = pd.read_csv(
+    "final_engineered_glaucoma_dataset.csv"
+)
+
+# ============================================
+# FEATURES
+# ============================================
+
+feature_cols = [
+
+    "AI",
+    "FDR",
+    "CPR",
+    "NPFA",
+    "PVI",
+
+    "SI_ratio",
+    "STOT_ratio",
+
+    "VD",
+    "CVR",
+    "VT",
+    "CIR",
+
+    "SIA",
+    "GAI",
+    "RGCI",
+
+    "PTR",
+    "FRC",
+
+    "VSL",
+    "TORT",
+    "FD",
+    "FDI"
+
+]
+
+# ============================================
+# CONVERT TO NUMERIC
+# ============================================
+
+for col in feature_cols:
+
+    df[col] = pd.to_numeric(
+        df[col],
+        errors="coerce"
+    )
+
+# ============================================
+# DROP NaNs
+# ============================================
+
+df = df.dropna(
+    subset=feature_cols + ["Label"]
+)
+
+print("\nRemaining samples:", len(df))
+
+# ============================================
+# X / y
+# ============================================
+
+X = df[feature_cols]
+
+y = df["Label"]
+
+# ============================================
+# STANDARDIZATION
+# ============================================
+
+scaler = StandardScaler()
+
+X_scaled = scaler.fit_transform(X)
+
+X_scaled_df = pd.DataFrame(
+    X_scaled,
+    columns=feature_cols
+)
+# ============================================
+# LASSO FEATURE SELECTION (5-FOLD CV)
+# ============================================
+
+print("\n===================================")
+print("LASSO FEATURE SELECTION")
+print("===================================")
+
+lasso_model = LogisticRegressionCV(
+
+    penalty="l1",
+
+    solver="liblinear",
+
+    cv=5,
+
+    scoring="roc_auc",
+
+    Cs=np.logspace(-4, 4, 50),
+
+    class_weight="balanced",
+
+    max_iter=5000,
+
+    random_state=42
+
+)
+
+lasso_model.fit(
+
+    X_scaled,
+
+    y
+
+)
+
+print(f"\nOptimal C selected: {lasso_model.C_[0]:.4f}")
+
+selected_df = pd.DataFrame({
+
+    "Feature": feature_cols,
+
+    "Coefficient": lasso_model.coef_[0]
+
+})
+
+selected_df = selected_df[
+    selected_df["Coefficient"] != 0
+].copy()
+
+stable_features = selected_df["Feature"].tolist()
+
+print("\nSelected Features:\n")
+
+print(selected_df.to_string(index=False))
+# ============================================
+# FINAL MODEL
+# ============================================
+final_model = LogisticRegression(
+
+    penalty=None,
+
+    solver="lbfgs",
+
+    max_iter=5000,
+
+    random_state=42
+
+)
+
+final_model.fit(
+
+    X_scaled_df[stable_features],
+
+    y
+
+)
+
+# ============================================
+# FINAL COEFFICIENTS
+# ============================================
+
+selected_df["Coefficient"] = final_model.coef_[0]
+
+final_coefs = selected_df["Coefficient"].values
+
+selected_df = pd.DataFrame({
+
+    "Feature": stable_features,
+
+    "Coefficient": final_coefs
+
+})
+
+# ============================================
+# COMPUTE P-VALUES
+# ============================================
+
+p_values = []
+
+for feature in stable_features:
+
+    normal = df[
+        df["Label"] == 0
+    ][feature]
+
+    glaucoma = df[
+        df["Label"] == 1
+    ][feature]
+
+    t_stat, p_val = ttest_ind(
+
+        glaucoma,
+        normal,
+
+        equal_var=False
+
+    )
+
+    p_values.append(p_val)
+
+selected_df["p_value"] = p_values
+
+# ============================================
+# KEEP SIGNIFICANT FEATURES
+# ============================================
+
+selected_df = selected_df[
+    selected_df["p_value"] < 0.05
+]
+
+# ============================================
+# UPDATE FEATURES
+# ============================================
+
+stable_features = selected_df[
+    "Feature"
+].tolist()
+
+final_coefs = selected_df[
+    "Coefficient"
+].values
+
+selected_df.to_csv(
+    "GRI_feature_table.csv",
+    index=False
+)
+
+print("\nSelected biomarkers:")
+
+print(selected_df)
