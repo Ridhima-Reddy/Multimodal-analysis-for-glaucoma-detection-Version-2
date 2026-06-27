@@ -1,0 +1,426 @@
+# ============================================
+# BLOCK 3 — COMPUTE ENGINEERED INDICES
+# ============================================
+
+import pandas as pd
+import numpy as np
+
+# ============================================
+# LOAD DATA
+# ============================================
+
+merged_df = pd.read_csv(
+    "merged_output.csv",
+    encoding="latin1",
+    low_memory=False
+)
+
+fundus_df = pd.read_csv("fundus_features.csv")
+
+# ============================================
+# SMART MERGE FUNDUS FEATURES (FIXED LOGIC)
+# ============================================
+
+def find_sno_column(dataframe):
+    for col in dataframe.columns:
+        if str(col).strip().lower() == 'sno':
+            return col
+    return None
+
+# Locate the exact 'SNO' columns dynamically
+sno_col1 = find_sno_column(merged_df)
+sno_col2 = find_sno_column(fundus_df)
+
+if not sno_col1 or not sno_col2:
+    raise ValueError(
+        f"Could not find 'SNO' column.\n"
+        f"merged_output.csv columns: {list(merged_df.columns)}\n"
+        f"fundus_features.csv columns: {list(fundus_df.columns)}"
+    )
+
+# Drop any overlapping columns from fundus_df to prevent duplicate columns (_x, _y)
+cols_to_drop_from_fundus = []
+for col2 in fundus_df.columns:
+    if col2 == sno_col2:
+        continue
+    for col1 in merged_df.columns:
+        if col1 != sno_col1 and str(col2).strip().lower() == str(col1).strip().lower():
+            cols_to_drop_from_fundus.append(col2)
+
+fundus_df_cleaned = fundus_df.drop(columns=cols_to_drop_from_fundus)
+
+# Perform the clean merge using the discovered SNO variants
+df = pd.merge(merged_df, fundus_df_cleaned, left_on=sno_col1, right_on=sno_col2, how="inner")
+
+# If the SNO column names were spelled differently, drop the redundant second SNO column
+if sno_col1 != sno_col2:
+    df = df.drop(columns=[sno_col2])
+
+# Rename the primary SNO column back to standard uppercase "SNO" for downstream consistency
+df = df.rename(columns={sno_col1: "SNO"})
+
+print("Merged Dataset Shape:", df.shape)
+
+# ============================================
+# CLEAN COLUMN NAMES
+# ============================================
+
+df.columns = [c.strip() for c in df.columns]
+
+# ============================================
+# CONVERT RELEVANT COLUMNS TO NUMERIC
+# ============================================
+
+numeric_cols = [
+
+    # OCTA PERFUSION
+    "TOT flux ONH",
+    "S flux ONH",
+    "I flux ONH",
+
+    "6x6_pfn_central",
+    "6x6_pfn_inner",
+    "6x6_pfn_outer",
+    "6x6_pfn_full",
+
+    "6x6_area",
+    "6x6_perimeter",
+    "6x6_circularity",
+
+    "6x6_vsl_central",
+    "6x6_vsl_outer",
+    "6x6_vsl_full",
+
+    "S per ONH",
+    "I per ONH",
+    "TOTpfnONH",
+
+    # RNFL
+    "S ONH",
+    "I ONH",
+    "ONH avg",
+
+    "SN GCC",
+    "IT GCC",
+    "AVG GCC",
+
+    # FUNDUS FEATURES
+    "VSL",
+    "TORT",
+    "FD",
+    "FDI"
+
+]
+
+for col in numeric_cols:
+
+    if col in df.columns:
+
+        df[col] = pd.to_numeric(
+            df[col],
+            errors="coerce"
+        )
+
+print("\n✅ Numeric conversion complete.")
+
+# ============================================
+# PERFUSION / FLUX INDICES
+# ============================================
+
+# --------------------------------
+# Asymmetry Index (AI)
+# --------------------------------
+
+df["AI"] = (
+    np.abs(df["S flux ONH"] - df["I flux ONH"])
+    /
+    (df["TOT flux ONH"] + 1e-8)
+)
+
+# --------------------------------
+# Flux Deficit Ratio (FDR)
+# --------------------------------
+
+df["FDR"] = (
+    df["6x6_pfn_full"]
+    /
+    (df["TOT flux ONH"] + 1e-8)
+)
+
+# --------------------------------
+# Central-to-Peripheral Ratio (CPR)
+# --------------------------------
+
+df["CPR"] = (
+    df["6x6_pfn_central"]
+    /
+    (df["6x6_pfn_outer"] + 1e-8)
+)
+
+# --------------------------------
+# Normalized Perfused Area (NPFA)
+# --------------------------------
+
+df["NPFA"] = (
+    df["6x6_pfn_full"]
+    /
+    (df["6x6_area"] + 1e-8)
+)
+
+# --------------------------------
+# Perfusion Variability Index (PVI)
+# --------------------------------
+
+pfn_cols = [
+    "6x6_pfn_central",
+    "6x6_pfn_inner",
+    "6x6_pfn_outer"
+]
+
+df["PVI"] = (
+    df[pfn_cols].std(axis=1)
+    /
+    (df[pfn_cols].mean(axis=1) + 1e-8)
+)
+
+# --------------------------------
+# Superior / Inferior Ratio
+# --------------------------------
+
+df["SI_ratio"] = (
+    df["S per ONH"]
+    /
+    (df["I per ONH"] + 1e-8)
+)
+
+# --------------------------------
+# Superior / Total Ratio
+# --------------------------------
+
+df["STOT_ratio"] = (
+    df["S per ONH"]
+    /
+    (df["TOTpfnONH"] + 1e-8)
+)
+
+# ============================================
+# VESSEL MORPHOLOGY INDICES
+# ============================================
+
+# --------------------------------
+# Vessel Density (VD)
+# --------------------------------
+
+df["VD"] = df["6x6_vsl_full"]
+
+# --------------------------------
+# Central-to-Outer Vessel Ratio (CVR)
+# --------------------------------
+
+df["CVR"] = (
+    df["6x6_vsl_central"]
+    /
+    (df["6x6_vsl_outer"] + 1e-8)
+)
+
+# --------------------------------
+# Vessel Tortuosity (VT)
+# --------------------------------
+
+df["VT"] = (
+    df["6x6_perimeter"]
+    /
+    (df["6x6_area"] + 1e-8)
+)
+
+# --------------------------------
+# Circularity (CIR)
+# --------------------------------
+
+df["CIR"] = df["6x6_circularity"]
+
+# ============================================
+# STRUCTURAL / RNFL INDICES
+# ============================================
+
+# --------------------------------
+# Structural Asymmetry Index (SIA)
+# --------------------------------
+
+df["SIA"] = (
+    np.abs(df["S ONH"] - df["I ONH"])
+    /
+    (df["ONH avg"] + 1e-8)
+)
+
+# --------------------------------
+# GCC Asymmetry Index (GAI)
+# --------------------------------
+
+df["GAI"] = (
+    df["SN GCC"] - df["IT GCC"]
+) / (df["AVG GCC"] + 1e-8)
+
+# --------------------------------
+# RNFL-GCC Coupling Index (RGCI)
+# --------------------------------
+
+df["RGCI"] = (
+    df["ONH avg"]
+    /
+    (df["AVG GCC"] + 1e-8)
+)
+
+# ============================================
+# PERFUSION-STRUCTURE COUPLING
+# ============================================
+
+# --------------------------------
+# Perfusion-to-Thickness Ratio (PTR)
+# --------------------------------
+
+df["PTR"] = (
+    df["6x6_pfn_full"]
+    /
+    (df["ONH avg"] + 1e-8)
+)
+
+# --------------------------------
+# Flux-RNFL Coupling (FRC)
+# --------------------------------
+
+df["FRC"] = (
+    df["TOT flux ONH"]
+    /
+    (df["ONH avg"] + 1e-8)
+)
+
+# ============================================
+# FUNDUS IMAGE FEATURES
+# ============================================
+
+# Already present:
+# VSL
+# TORT
+# FD
+# FDI
+
+# ============================================
+# CREATE LABEL
+# ============================================
+
+df["Label"] = df["Label"].map({
+    "Normal": 0,
+    "Glaucoma": 1
+})
+
+# ============================================
+# REMOVE INVALID VALUES
+# ============================================
+
+df.replace(
+    [np.inf, -np.inf],
+    np.nan,
+    inplace=True
+)
+
+# ============================================
+# KEEP ONLY ROWS VALID FOR ENGINEERED FEATURES
+# ============================================
+
+required_cols = [
+
+    "AI",
+    "FDR",
+    "CPR",
+    "NPFA",
+    "PVI",
+    "SI_ratio",
+    "STOT_ratio",
+
+    "VD",
+    "CVR",
+    "VT",
+    "CIR",
+
+    "SIA",
+    "GAI",
+    "RGCI",
+
+    "PTR",
+    "FRC",
+
+    "VSL",
+    "TORT",
+    "FD",
+    "FDI",
+
+    "Label"
+
+]
+
+# ============================================
+# CHECK MISSING VALUES
+# ============================================
+
+print("\nMissing Values Per Biomarker:\n")
+
+missing_counts = df[required_cols].isna().sum()
+
+print(
+    missing_counts[missing_counts > 0]
+    .sort_values(ascending=False)
+)
+# ============================================
+# MEDIAN IMPUTATION FOR MISSING BIOMARKERS
+# ============================================
+
+for col in required_cols:
+
+    if col == "Label":
+        continue
+
+    median_value = df[col].median()
+
+    df[col] = df[col].fillna(
+        median_value
+    )
+
+print("\n✅ Missing biomarker values imputed using median.")
+
+print("\nRows remaining after cleaning:", len(df))
+
+# ============================================
+# SAVE FINAL DATASET
+# ============================================
+
+df.to_csv(
+    "final_engineered_glaucoma_dataset.csv",
+    index=False
+)
+
+# ============================================
+# SUMMARY
+# ============================================
+
+print("\n✅ Final engineered dataset created.")
+
+print("\nDataset Shape:")
+print(df.shape)
+
+print("\nClass Distribution:")
+print(df["Label"].value_counts())
+
+print("\nGenerated Biomarkers:")
+
+generated_cols = [
+    "AI", "FDR", "CPR", "NPFA", "PVI", "SI_ratio", "STOT_ratio",
+    "VD", "CVR", "VT", "CIR", "SIA", "GAI", "RGCI", "PTR", "FRC",
+    "VSL", "TORT", "FD", "FDI"
+]
+
+for col in generated_cols:
+    print(" -", col)
+
+print("\nFirst 5 Rows:")
+print(df[generated_cols + ["Label"]].head())
