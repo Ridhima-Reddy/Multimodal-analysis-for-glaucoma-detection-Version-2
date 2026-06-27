@@ -1,0 +1,520 @@
+# ============================================
+# CORRECTED CONFIDENCE-BASED MULTIMODAL FUSION
+# WITH NO LEAKAGE, 5-FOLD CV, AND RESUME CAPABILITY
+# ============================================
+
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader, Subset
+import torchvision.transforms as T
+import torchvision.models as models
+
+import pandas as pd
+import numpy as np
+import json
+import os
+import glob
+import copy
+
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import roc_auc_score, accuracy_score, confusion_matrix
+from sklearn.model_selection import StratifiedKFold
+
+from tqdm import tqdm
+from PIL import Image
+
+# ============================================
+# DEVICE
+# ============================================
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Using device:", device)
+
+# ============================================
+# UTILITIES
+# ============================================
+
+def clean_column_names(df):
+    df.columns = [col.strip() for col in df.columns]
+    return df
+
+def clean_numeric_data(series):
+    series = series.astype(str)
+    series = series.str.replace('..', '.', regex=False)
+    series = series.str.replace(',', '.', regex=False)
+    series = series.str.replace(' ', '', regex=False)
+    return pd.to_numeric(series, errors='coerce')
+
+def compute_metrics(y_true, y_probs, threshold=0.5):
+    y_true = torch.tensor(y_true).numpy()
+    y_probs = torch.tensor(y_probs).numpy()
+    auc = roc_auc_score(y_true, y_probs)
+    y_pred = (y_probs >= threshold).astype(int)
+    acc = accuracy_score(y_true, y_pred)
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
+    sens = tp / (tp + fn) if (tp + fn) > 0 else 0
+    spec = tn / (tn + fp) if (tn + fp) > 0 else 0
+    return auc, acc, sens, spec
+
+# ============================================
+# DATASET (NO SCALING, NO TRANSFORM LEAKAGE)
+# ============================================
+
+class RawMultimodalGlaucomaDataset(Dataset):
+    """Dataset that loads raw (unscaled) OCTA features and image paths.
+       Does NOT apply any scaling or transforms."""
+    def __init__(self, image_data_dir, octa_csv_path):
+        self.image_data_dir = image_data_dir
+
+        self.octa_data = pd.read_csv(octa_csv_path)
+        self.octa_data = clean_column_names(self.octa_data)
+
+        self.octa_features = [
+            'I per ONH',
+            'S flux ONH',
+            'I flux ONH',
+            'S per ONH',
+            'SS ONH/10',
+            '3x3_vsl_inner',
+            '6x6_pfn_central',
+            '6x6_pfn_outer',
+            'N per ONH',
+            'TOTpfnONH',
+            'SS 3x3'
+        ]
+
+        print("\nUsing OCTA Features:")
+        for f in self.octa_features:
+            print(" -", f)
+
+        # Clean numeric columns
+        for feature in self.octa_features:
+            self.octa_data[feature] = clean_numeric_data(self.octa_data[feature])
+
+        self.octa_data = self.octa_data.dropna(subset=self.octa_features)
+
+        # Store raw features (numpy, unscaled)
+        self.raw_features = self.octa_data[self.octa_features].values.astype(np.float32)
+
+        # Labels from folder structure
+        glaucoma_folder = os.path.join(image_data_dir, "Glaucoma")
+        normal_folder = os.path.join(image_data_dir, "Normal")
+
+        glaucoma_ids = []
+        normal_ids = []
+
+        for file in os.listdir(glaucoma_folder):
+            if file.endswith((".png", ".jpg", ".jpeg")):
+                glaucoma_ids.append(str(int(float(file.split("_")[0]))).strip())
+
+        for file in os.listdir(normal_folder):
+            if file.endswith((".png", ".jpg", ".jpeg")):
+                normal_ids.append(str(int(float(file.split("_")[0]))).strip())
+
+        id_column = self.octa_data.columns[0]
+        self.octa_data["ID_str"] = (
+            self.octa_data[id_column]
+            .astype(float)
+            .astype(int)
+            .astype(str)
+            .str.strip()
+        )
+
+        self.octa_data["glaucoma"] = 0
+        glaucoma_mask = self.octa_data["ID_str"].isin(glaucoma_ids)
+        self.octa_data.loc[glaucoma_mask, "glaucoma"] = 1
+
+        print("\nLabel Distribution:")
+        print("Glaucoma:", glaucoma_mask.sum())
+        print("Normal:", len(self.octa_data) - glaucoma_mask.sum())
+
+        # Image paths
+        self.image_paths = []
+        for idx in range(len(self.octa_data)):
+            patient_id = self.octa_data.iloc[idx]["ID_str"]
+            label = self.octa_data.iloc[idx]["glaucoma"]
+            folder = glaucoma_folder if label == 1 else normal_folder
+            matches = glob.glob(os.path.join(folder, f"{patient_id}_*"))
+            if len(matches) > 0:
+                self.image_paths.append(matches[0])
+            else:
+                self.image_paths.append(None)
+
+        self.labels = self.octa_data["glaucoma"].values.astype(np.float32)
+        print(f"\nDataset Size: {len(self.octa_data)}")
+
+    def __len__(self):
+        return len(self.octa_data)
+
+    def __getitem__(self, idx):
+        # Return raw features (unscaled), image path, label
+        octa_raw = self.raw_features[idx]  # shape (7,)
+        label = self.labels[idx]
+        image_path = self.image_paths[idx]
+        return octa_raw, image_path, label
+
+# ============================================
+# WRAPPER FOR FOLD-SPECIFIC SCALING AND TRANSFORMS
+# ============================================
+
+class PreprocessedDataset(Dataset):
+    """Wraps RawMultimodalGlaucomaDataset with fold-specific scaler and image transform."""
+    def __init__(self, raw_dataset, indices, scaler, image_transform):
+        self.raw_dataset = raw_dataset
+        self.indices = indices
+        self.scaler = scaler
+        self.image_transform = image_transform
+
+        # Pre-compute scaled features for efficiency (since dataset is small)
+        raw_features_all = raw_dataset.raw_features
+        # Fit scaler on train indices only (provided externally)
+        # But scaler is already fitted and passed; we just transform.
+        self.scaled_features = self.scaler.transform(raw_features_all[indices])
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, idx):
+        orig_idx = self.indices[idx]
+        octa = self.scaled_features[idx].astype(np.float32)
+        octa = torch.FloatTensor(octa)
+
+        _, image_path, label = self.raw_dataset[orig_idx]
+        label = torch.tensor(label, dtype=torch.float32)
+
+        if image_path is not None and os.path.exists(image_path):
+            image = Image.open(image_path).convert("RGB")
+        else:
+            image = Image.new("RGB", (224, 224), color="white")
+
+        if self.image_transform:
+            image = self.image_transform(image)
+
+        return image, octa, label
+
+# ============================================
+# CONFIDENCE FUSION MODEL (UNCHANGED ARCHITECTURE)
+# ============================================
+
+class ConfidenceBasedFusion(nn.Module):
+    def __init__(self, num_octa_features, cnn_pretrained_path, confidence_threshold=0.3):
+        super().__init__()
+        self.confidence_threshold = confidence_threshold
+        self.octa_weight = nn.Parameter(torch.tensor(0.0))
+
+        # Image model
+        self.image_model = models.resnet18(weights=None)
+        self.image_model.fc = nn.Sequential(
+            nn.Dropout(0.2),
+            nn.Linear(self.image_model.fc.in_features, 1)
+        )
+        checkpoint = torch.load(cnn_pretrained_path, map_location="cpu")
+        self.image_model.load_state_dict(checkpoint)
+
+        # Partial freezing (keep layer4 and fc trainable)
+        for name, param in self.image_model.named_parameters():
+            if "layer4" not in name and "fc" not in name:
+                param.requires_grad = False
+
+        # OCTA model
+        self.octa_model = nn.Sequential(
+            nn.Linear(num_octa_features, 128),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(128, 64),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(64, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1)
+        )
+
+        print("\n✅ Improved Confidence Fusion Initialized")
+        print(f"Threshold: {confidence_threshold}")
+        print(f"Initial OCTA Weight: {torch.sigmoid(self.octa_weight).item():.3f}")
+
+    def forward(self, images, octa_metrics):
+        image_logits = self.image_model(images).squeeze(1)
+        image_probs = torch.sigmoid(image_logits)
+        octa_logits = self.octa_model(octa_metrics).squeeze(1)
+
+        confidence_mask = (
+            (image_probs >= self.confidence_threshold) &
+            (image_probs <= (1 - self.confidence_threshold))
+        ).float()
+
+        octa_weight = torch.sigmoid(self.octa_weight)
+
+        final_logits = (
+            image_logits * (1 - confidence_mask) +
+            (image_logits * (1 - octa_weight) + octa_logits * octa_weight) * confidence_mask
+        )
+        return final_logits, octa_weight
+
+# ============================================
+# TRAINING (FOLD-SPECIFIC, NO LEAKAGE)
+# ============================================
+
+def train_model(model, train_loader, val_loader, threshold, fold, num_epochs=25, lr=1e-4):
+    train_labels = train_loader.dataset.raw_dataset.labels[
+        train_loader.dataset.indices
+    ]
+    
+    pos_count = np.sum(train_labels)
+    neg_count = len(train_labels) - pos_count
+    
+    pos_weight = torch.tensor(
+        [neg_count / pos_count],
+        dtype=torch.float32,
+        device=device
+    )
+    
+    print(f"Normal={neg_count}, Glaucoma={pos_count}")
+    print(f"Using pos_weight={pos_weight.item():.3f}")
+    
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=lr,
+        weight_decay=1e-4
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
+
+    best_auc = 0
+    patience = 15
+    patience_counter = 0
+
+    for epoch in range(num_epochs):
+        model.train()
+        for images, octa, labels in tqdm(train_loader, desc=f"Fold {fold} Epoch {epoch+1}"):
+            images, octa, labels = images.to(device), octa.to(device), labels.to(device)
+            optimizer.zero_grad()
+            outputs, _ = model(images, octa)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+        scheduler.step()
+
+        # Validation
+        model.eval()
+        all_probs, all_labels = [], []
+        with torch.no_grad():
+            for images, octa, labels in val_loader:
+                images, octa = images.to(device), octa.to(device)
+                outputs, octa_weight = model(images, octa)
+                probs = torch.sigmoid(outputs).cpu()
+                all_probs.extend(probs)
+                all_labels.extend(labels)
+
+        auc, acc, sens, spec = compute_metrics(all_labels, all_probs)
+        print(f"Fold {fold} | Epoch {epoch+1:02d} | AUC {auc:.4f} | Acc {acc:.3f} | Sens {sens:.3f} | Spec {spec:.3f} | OCTA Weight {octa_weight.item():.3f}")
+
+        if auc > best_auc:
+            best_auc = auc
+            patience_counter = 0
+            torch.save(model.state_dict(), f"best_thr_{threshold}_fold_{fold}.pth")
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print("Early stopping")
+                break
+
+# ============================================
+# EVALUATION
+# ============================================
+
+def evaluate_model(model, loader):
+    model.eval()
+    all_probs, all_labels = [], []
+    final_weight = 0
+    with torch.no_grad():
+        for images, octa, labels in loader:
+            images, octa = images.to(device), octa.to(device)
+            outputs, octa_weight = model(images, octa)
+            probs = torch.sigmoid(outputs).cpu()
+            all_probs.extend(probs)
+            all_labels.extend(labels)
+            final_weight = octa_weight.item()
+    auc, acc, sens, spec = compute_metrics(all_labels, all_probs)
+    return {"auc": auc, "acc": acc, "sens": sens, "spec": spec, "weight": final_weight}
+
+# ============================================
+# 5-FOLD CV WITH NO LEAKAGE AND RESUME
+# ============================================
+
+CHECKPOINT_DIR = "cv_checkpoints"
+
+def run_cv_with_resume(raw_dataset, stage1_path, threshold):
+    print("\n")
+    print("=" * 90)
+    print(f"TESTING THRESHOLD = {threshold}")
+    print(f"UNCERTAINTY RANGE = {threshold:.2f} - {1-threshold:.2f}")
+    print("=" * 90)
+
+    # Create checkpoint directory for this threshold
+    thr_dir = os.path.join(CHECKPOINT_DIR, f"thr_{threshold}")
+    os.makedirs(thr_dir, exist_ok=True)
+
+    train_transform = T.Compose([
+        T.Resize((224, 224)),
+        T.RandomHorizontalFlip(),
+        T.RandomRotation(10),
+        T.RandomAffine(0, translate=(0.1, 0.1)),
+        T.ColorJitter(brightness=0.2, contrast=0.2),
+        T.ToTensor(),
+        T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ])
+
+    val_transform = T.Compose([
+        T.Resize((224, 224)),
+        T.ToTensor(),
+        T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ])
+
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    fold_results = []
+
+    # Load already completed folds
+    completed_folds = set()
+    for fold in range(1, 6):
+        result_file = os.path.join(thr_dir, f"fold_{fold}_result.json")
+        if os.path.exists(result_file):
+            with open(result_file, 'r') as f:
+                data = json.load(f)
+                fold_results.append(data)
+                completed_folds.add(fold)
+                print(f"Resuming: Found completed fold {fold} with AUC {data['auc']:.4f}")
+
+    for fold, (train_idx, val_idx) in enumerate(skf.split(range(len(raw_dataset)), raw_dataset.labels)):
+        fold_num = fold + 1
+        if fold_num in completed_folds:
+            continue
+
+        print("\n" + "=" * 60)
+        print(f"FOLD {fold_num}/5")
+        print("=" * 60)
+
+        # Fit scaler on raw training features only
+        scaler = StandardScaler()
+        raw_train_features = raw_dataset.raw_features[train_idx]
+        scaler.fit(raw_train_features)
+
+        # Create train and validation datasets with fold-specific scaler and transforms
+        train_dataset = PreprocessedDataset(raw_dataset, train_idx, scaler, train_transform)
+        val_dataset = PreprocessedDataset(raw_dataset, val_idx, scaler, val_transform)
+
+        train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=4, pin_memory=True)
+        val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, num_workers=4, pin_memory=True)
+
+        # Fresh model per fold
+        model = ConfidenceBasedFusion(
+            num_octa_features=len(raw_dataset.octa_features),
+            cnn_pretrained_path=stage1_path,
+            confidence_threshold=threshold
+        ).to(device)
+
+        train_model(model, train_loader, val_loader, threshold, fold_num)
+
+        model.load_state_dict(torch.load(f"best_thr_{threshold}_fold_{fold_num}.pth"))
+        results = evaluate_model(model, val_loader)
+
+        # Save result to checkpoint directory
+        with open(os.path.join(thr_dir, f"fold_{fold_num}_result.json"), 'w') as f:
+            json.dump(results, f, indent=2)
+
+        fold_results.append(results)
+        print("\nFold Results")
+        print(results)
+
+    return fold_results
+
+# ============================================
+# MAIN
+# ============================================
+
+def main():
+    IMAGE_DATA_DIR = "Dataset"
+    OCTA_CSV_PATH = "cleaned_octa_data.csv"
+    STAGE1_MODEL_PATH = "best_enhanced_resnet18.pth"
+    thresholds = [0.1, 0.2, 0.3, 0.4, 0.45]
+
+    raw_dataset = RawMultimodalGlaucomaDataset(IMAGE_DATA_DIR, OCTA_CSV_PATH)
+    num_features = len(raw_dataset.octa_features)
+
+    all_results = {}
+
+    for threshold in thresholds:
+        # Run CV with resume, get list of fold results (only those computed now)
+        fold_results = run_cv_with_resume(raw_dataset, STAGE1_MODEL_PATH, threshold)
+
+        # However, we also need to load previously saved results for aggregation
+        # So we reload all fold results from checkpoint directory
+        thr_dir = os.path.join(CHECKPOINT_DIR, f"thr_{threshold}")
+        all_fold_results = []
+        if os.path.exists(thr_dir):
+            for fold in range(1, 6):
+                result_file = os.path.join(thr_dir, f"fold_{fold}_result.json")
+                if os.path.exists(result_file):
+                    with open(result_file, 'r') as f:
+                        all_fold_results.append(json.load(f))
+
+        if len(all_fold_results) != 5:
+            print(f"Warning: For threshold {threshold}, only {len(all_fold_results)} folds completed. Please run again to complete.")
+            # Still compute summary from available folds
+        fold_results = all_fold_results
+
+        if len(fold_results) == 0:
+            print(f"No folds completed for threshold {threshold}, skipping.")
+            continue
+
+        aucs = [x["auc"] for x in fold_results]
+        accs = [x["acc"] for x in fold_results]
+        senss = [x["sens"] for x in fold_results]
+        specs = [x["spec"] for x in fold_results]
+        weights = [x["weight"] for x in fold_results]
+
+        summary = {
+            "auc_mean": np.mean(aucs),
+            "auc_std": np.std(aucs),
+            "acc_mean": np.mean(accs),
+            "acc_std": np.std(accs),
+            "sens_mean": np.mean(senss),
+            "spec_mean": np.mean(specs),
+            "weight_mean": np.mean(weights)
+        }
+        all_results[threshold] = summary
+
+        print("\n" + "=" * 80)
+        print("THRESHOLD SUMMARY")
+        print("=" * 80)
+        print(f"Threshold:        {threshold}")
+        print(f"Range:            {threshold:.2f}-{1-threshold:.2f}")
+        print(f"\nAUC: {summary['auc_mean']:.4f} ± {summary['auc_std']:.4f}")
+        print(f"Accuracy: {summary['acc_mean']:.4f} ± {summary['acc_std']:.4f}")
+        print(f"Sensitivity: {summary['sens_mean']:.4f}")
+        print(f"Specificity: {summary['spec_mean']:.4f}")
+        print(f"OCTA Weight: {summary['weight_mean']:.4f}")
+
+    # Final comparison
+    print("\n" + "=" * 100)
+    print("FINAL THRESHOLD COMPARISON")
+    print("=" * 100)
+    best_auc = 0
+    best_threshold = None
+    for threshold, result in all_results.items():
+        print(f"\nThreshold: {threshold} | AUC: {result['auc_mean']:.4f} ± {result['auc_std']:.4f} | Acc: {result['acc_mean']:.4f} | Sens: {result['sens_mean']:.4f} | Spec: {result['spec_mean']:.4f}")
+        if result["auc_mean"] > best_auc:
+            best_auc = result["auc_mean"]
+            best_threshold = threshold
+
+    print("\n" + "=" * 100)
+    print("BEST THRESHOLD")
+    print("=" * 100)
+    print(f"Best Threshold: {best_threshold}")
+    print(f"Best Range:     {best_threshold:.2f}-{1-best_threshold:.2f}")
+    print(f"Best AUC:       {best_auc:.4f}")
+
+if __name__ == "__main__":
+    main()
